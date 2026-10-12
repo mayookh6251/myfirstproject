@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  deepguard:
+    build: .
+    container_name: deepguard_ai
+    restart: always
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./users.db:/app/users.db
+      - ./models:/app/models
+      - ./results:/app/results
+    environment:
+      - PYTHONUNBUFFERED=1
