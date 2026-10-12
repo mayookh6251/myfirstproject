@@ -18,6 +18,44 @@ from extract_faces import resolve_cascade_classifier, detect_and_crop_face
 from dataset_loader import get_inference_transform
 from evaluate_video import predict_video
 
+#supabase client
+@st.cache_resource
+def get_supabase():
+    from supabase import create_client
+
+    return create_client(
+        st.secrets["SUPABASE_URL"],
+        st.secrets["SUPABASE_KEY"]
+    )
+
+def save_detection(username, file_name, media_type,
+                   prediction, confidence=None):
+    try:
+        db = get_supabase()
+
+        record = {
+            "username": username,
+            "file_name": file_name,
+            "media_type": media_type,
+            "prediction": prediction,
+            "confidence": (
+                float(confidence)
+                if confidence is not None else None
+            ),
+        }
+
+        db.table("detection_history").insert(
+            record
+        ).execute()
+
+        return True
+
+    except Exception as exc:
+        st.warning(f"Detection history could not be saved: {exc}")
+        return False
+
+
+
 # ==============================================================================
 # Page Configuration
 # ==============================================================================
@@ -492,7 +530,7 @@ def render_navbar():
     </div>
     """, unsafe_allow_html=True)
 
-    nav_cols = st.columns([1.2, 1.2, 1.2, 1.2, 1.2, 0.8])
+    nav_cols = st.columns(7)
     with nav_cols[0]:
         if st.button("🏠 Dashboard", use_container_width=True):
             st.session_state.current_page = "Dashboard"
@@ -513,11 +551,19 @@ def render_navbar():
         if st.button("ℹ️ About System", use_container_width=True):
             st.session_state.current_page = "About"
             st.rerun()
+    
+
     with nav_cols[5]:
+        if st.button("📜 History", use_container_width=True):
+            st.session_state.current_page = "History"
+            st.rerun()
+
+    with nav_cols[6]:
         if st.button("🚪 Logout", use_container_width=True):
             st.session_state.authenticated = False
             st.session_state.username = ""
             st.rerun()
+
 
 
 # ==============================================================================
@@ -722,6 +768,19 @@ def render_image_detection(model, cascade, transform, device, model_loaded: bool
                     pred_class = "UNCERTAIN"
                     badge_html = '<div class="badge-uncertain">UNCERTAIN</div>'
                     confidence = max(fake_prob, real_prob)
+                
+                save_detection(
+                    username=st.session_state.username,
+                    file_name=(
+                        uploaded_file.name
+                        if uploaded_file is not None
+                        else sample_choice
+                    ),
+                    media_type="image",
+                    prediction=pred_class,
+                    confidence=confidence
+                )
+
 
                 st.markdown(f"<div style='text-align: center; margin: 16px 0;'>{badge_html}</div>", unsafe_allow_html=True)
                 
@@ -846,6 +905,19 @@ def render_video_detection(model, cascade, transform, device, model_loaded: bool
                 conf = results["confidence"]
                 p_fake = results["fake_probability"]
                 p_real = results["real_probability"]
+                
+                save_detection(
+                    username=st.session_state.username,
+                    file_name=(
+                        uploaded_video.name
+                        if uploaded_video is not None
+                        else os.path.basename(video_source_path)
+                    ),
+                    media_type="video",
+                    prediction=pred,
+                    confidence=conf
+                )
+
 
                 if pred == "FAKE":
                     badge_html = '<div class="badge-fake">VIDEO VERDICT: FAKE</div>'
@@ -988,6 +1060,59 @@ def render_about_page():
         </div>
         """, unsafe_allow_html=True)
 
+# ==============================================================================
+# Detection History Page
+# ==============================================================================
+
+def render_detection_history():
+    st.markdown(
+        "## 📜 Detection History"
+    )
+    st.caption(
+        "View your previously completed image and video analyses."
+    )
+
+    if st.button("🔄 Refresh History"):
+        st.rerun()
+
+    try:
+        db = get_supabase()
+
+        response = (
+            db.table("detection_history")
+            .select(
+                "created_at, file_name, media_type, "
+                "prediction, confidence"
+            )
+            .eq("username", st.session_state.username)
+            .order("created_at", desc=True)
+            .limit(100)
+            .execute()
+        )
+
+        records = response.data
+
+        if records:
+            st.success(
+                f"Found {len(records)} detection records."
+            )
+
+            st.dataframe(
+                records,
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.info(
+                "No detection history yet. "
+                "Analyze an image or video first."
+            )
+
+    except Exception as e:
+        st.error(
+            f"Could not load detection history: {e}"
+        )
+
 
 # ==============================================================================
 # Application Router
@@ -1011,6 +1136,8 @@ def main():
             render_evaluation_page()
         elif st.session_state.current_page == "About":
             render_about_page()
+        elif st.session_state.current_page == "History":
+            render_detection_history()
 
 
 if __name__ == "__main__":
