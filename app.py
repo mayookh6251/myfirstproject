@@ -106,19 +106,14 @@ def load_deepfake_detector():
 
     cascade_path = ensure_ascii_safe_copy(os.path.join(BASE_DIR, "cascade", "haarcascade_frontalface_default.xml"))
     
-    if os.path.exists(MODEL_PATH):
-        try:
-            model = load_model_checkpoint(MODEL_PATH, device=device)
-            model_loaded = True
-            model_error = None
-        except Exception as e:
-            model = None
-            model_loaded = False
-            model_error = str(e)
-    else:
+    try:
+        model = load_model_checkpoint(MODEL_PATH, device=device)
+        model_loaded = True
+        model_error = None
+    except (FileNotFoundError, OSError, RuntimeError, ValueError) as e:
         model = None
         model_loaded = False
-        model_error = "Model weights not found. Please run training (python train_transfer.py)."
+        model_error = str(e)
 
     try:
         cascade = resolve_cascade_classifier(cascade_path)
@@ -655,7 +650,7 @@ def render_image_detection(model, cascade, transform, device, model_loaded: bool
     """, unsafe_allow_html=True)
 
     if not model_loaded:
-        st.warning("⚠️ Model checkpoint not found at models/best_resnet18_deepfake.pth. Please train the model first.")
+        st.warning("The detection model is unavailable. See the model error above.")
         return
 
     # Compact 3-column layout
@@ -857,7 +852,7 @@ def render_video_detection(model, cascade, transform, device, model_loaded: bool
     """, unsafe_allow_html=True)
 
     if not model_loaded:
-        st.warning("⚠️ Model checkpoint not found at models/best_resnet18_deepfake.pth. Please train the model first.")
+        st.warning("The detection model is unavailable. See the model error above.")
         return
 
     col_input, col_analysis = st.columns([1.1, 1.4], gap="medium")
@@ -1156,6 +1151,8 @@ def main():
         render_navbar()
 
         model, cascade, transform, device, model_loaded, model_error = load_deepfake_detector()
+        if model_error:
+            st.error(f"Model unavailable: {model_error}")
 
         if st.session_state.current_page == "Dashboard":
             render_dashboard(model_loaded, device)
