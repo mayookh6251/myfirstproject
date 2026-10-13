@@ -86,14 +86,7 @@ def load_model_checkpoint(
     else:
         state_dict = checkpoint
         
-    try:
-        model.load_state_dict(state_dict, strict=True)
-    except RuntimeError as exc:
-        raise RuntimeError(
-            "Checkpoint weights are incompatible with the trained DeepfakeResNet18 "
-            "architecture (ResNet18 backbone, Dropout + 512-to-2 classifier). "
-            f"Details: {exc}"
-        ) from exc
+    model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
     return model
