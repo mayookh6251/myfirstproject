@@ -2,14 +2,13 @@
 
 import os
 import io
-import logging
 import time
 import tempfile
 import shutil
 import cv2
 import numpy as np
 import pandas as pd
-from PIL import Image, ImageDraw, ImageOps, UnidentifiedImageError
+from PIL import Image, ImageDraw
 import torch
 import streamlit as st
 
@@ -18,10 +17,6 @@ from model_def import get_model, load_model_checkpoint, LABEL_MAP
 from extract_faces import resolve_cascade_classifier, detect_and_crop_face
 from dataset_loader import get_inference_transform
 from evaluate_video import predict_video
-
-logger = logging.getLogger(__name__)
-MAX_IMAGE_PIXELS = 40_000_000
-SUPPORTED_IMAGE_FORMATS = {"JPEG", "PNG", "WEBP"}
 
 #supabase client
 @st.cache_resource
@@ -55,9 +50,8 @@ def save_detection(username, file_name, media_type,
 
         return True
 
-    except Exception:
-        logger.exception("Failed to save detection history to Supabase.")
-        st.warning("The analysis completed, but detection history could not be saved.")
+    except Exception as exc:
+        st.warning(f"Detection history could not be saved: {exc}")
         return False
 
 
@@ -81,144 +75,6 @@ MODEL_PATH = os.path.join(BASE_DIR, "models", "best_resnet18_deepfake.pth")
 RESULTS_DIR = os.path.join(BASE_DIR, "results")
 SAMPLE_IMAGES_DIR = os.path.join(BASE_DIR, "sample_images")
 SAMPLE_VIDEOS_DIR = os.path.join(BASE_DIR, "ffpp_videos")
-
-
-def _load_safe_image(source) -> Image.Image:
-    """Validate an uploaded/sample image and return an EXIF-corrected RGB copy."""
-    try:
-        with Image.open(source) as opened:
-            if opened.format not in SUPPORTED_IMAGE_FORMATS:
-                raise ValueError("Unsupported image format. Use JPEG, PNG, or WEBP.")
-            width, height = opened.size
-            if width <= 0 or height <= 0 or width * height > MAX_IMAGE_PIXELS:
-                raise ValueError(
-                    f"Image dimensions are invalid or exceed the {MAX_IMAGE_PIXELS:,}-pixel limit."
-                )
-            corrected = ImageOps.exif_transpose(opened)
-            corrected.load()
-            return corrected.convert("RGB")
-    except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
-        raise ValueError("The image is corrupt or could not be decoded.") from exc
-
-
-def _decode_for_opencv(image: Image.Image) -> np.ndarray:
-    """Encode normalized RGB pixels and verify OpenCV can decode the image."""
-    rgb = np.asarray(image)
-    if rgb.ndim != 3 or rgb.shape[2] != 3 or rgb.size == 0:
-        raise ValueError("Image conversion did not produce valid RGB pixels.")
-    success, encoded = cv2.imencode(".png", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
-    if not success:
-        raise ValueError("OpenCV could not encode the validated image.")
-    decoded = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
-    if decoded is None or decoded.size == 0 or decoded.ndim != 3 or decoded.shape[2] != 3:
-        raise ValueError("OpenCV could not decode the validated image.")
-    return decoded
-
-
-def _detect_valid_faces(image: np.ndarray, cascade) -> list[tuple[int, int, int, int]]:
-    if cascade is None or cascade.empty():
-        raise RuntimeError("The face detector is unavailable.")
-    if image is None or image.size == 0 or image.ndim != 3 or image.shape[2] != 3:
-        raise ValueError("OpenCV returned an invalid image array.")
-
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    equalized_gray = cv2.equalizeHist(gray)
-    raw_candidates = []
-    for detection_image, scale_factor, min_neighbors, min_size in (
-        (gray, 1.1, 5, (30, 30)),
-        (equalized_gray, 1.03, 3, (15, 15)),
-    ):
-        detected = cascade.detectMultiScale(
-            detection_image,
-            scaleFactor=scale_factor,
-            minNeighbors=min_neighbors,
-            minSize=min_size,
-        )
-        raw_candidates.extend(detected)
-
-    image_height, image_width = image.shape[:2]
-    faces = []
-    for candidate in raw_candidates:
-        if len(candidate) != 4:
-            continue
-        x, y, width, height = (int(value) for value in candidate)
-        if width <= 0 or height <= 0:
-            continue
-        x1, y1 = max(0, x), max(0, y)
-        x2, y2 = min(image_width, x + width), min(image_height, y + height)
-        if x2 <= x1 or y2 <= y1:
-            continue
-        box = (x1, y1, x2 - x1, y2 - y1)
-        if not any(
-            min(box[2] * box[3], kept[2] * kept[3]) > 0
-            and (
-                max(0, min(x1 + box[2], kept[0] + kept[2]) - max(x1, kept[0]))
-                * max(0, min(y1 + box[3], kept[1] + kept[3]) - max(y1, kept[1]))
-            ) / min(box[2] * box[3], kept[2] * kept[3]) > 0.8
-            for kept in faces
-        ):
-            faces.append(box)
-
-    faces.sort(key=lambda box: box[2] * box[3], reverse=True)
-    return faces
-
-
-def _make_face_tensors(image: np.ndarray, faces, transform) -> list[torch.Tensor]:
-    image_height, image_width = image.shape[:2]
-    face_tensors = []
-    for x, y, width, height in faces:
-        margin_x, margin_y = int(width * 0.15), int(height * 0.15)
-        x1, y1 = max(0, x - margin_x), max(0, y - margin_y)
-        x2 = min(image_width, x + width + margin_x)
-        y2 = min(image_height, y + height + margin_y)
-        if x2 <= x1 or y2 <= y1:
-            continue
-        face_crop = image[y1:y2, x1:x2]
-        if face_crop.size == 0 or face_crop.ndim != 3 or face_crop.shape[2] != 3:
-            continue
-        face_rgb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
-        face_tensor = transform(Image.fromarray(face_rgb))
-        if (
-            not isinstance(face_tensor, torch.Tensor)
-            or face_tensor.shape != (3, 224, 224)
-            or not torch.isfinite(face_tensor).all()
-        ):
-            raise ValueError("Face preprocessing returned an invalid model input.")
-        face_tensors.append(face_tensor)
-    return face_tensors
-
-
-def _analyze_single_face(image: Image.Image, cascade, transform, model, device) -> dict:
-    cv_image = _decode_for_opencv(image)
-    faces = _detect_valid_faces(cv_image, cascade)
-    if not faces:
-        return {"status": "no_face"}
-    if len(faces) > 1:
-        return {"status": "multiple_faces", "face_count": len(faces)}
-
-    face_tensors = _make_face_tensors(cv_image, faces, transform)
-    if not face_tensors:
-        raise ValueError("Face detection returned a box but no valid face crop.")
-
-    batch = torch.stack(face_tensors).to(device)
-    with torch.no_grad():
-        start_time = time.time()
-        logits = model(batch)
-        latency = (time.time() - start_time) * 1000.0
-        if logits.ndim != 2 or logits.shape != (1, 2) or not torch.isfinite(logits).all():
-            raise ValueError("The model returned invalid output for the detected face.")
-        probabilities = torch.softmax(logits, dim=1)[0].cpu().numpy()
-
-    pred_index = int(np.argmax(probabilities))
-    pred_class = "FAKE" if pred_index == 0 else "REAL"
-    return {
-        "status": "ok",
-        "prediction": pred_class,
-        "confidence": float(probabilities[pred_index]),
-        "fake_prob": float(probabilities[0]),
-        "real_prob": float(probabilities[1]),
-        "latency": latency,
-    }
 
 
 def ensure_ascii_safe_copy(path: str) -> str:
@@ -250,14 +106,19 @@ def load_deepfake_detector():
 
     cascade_path = ensure_ascii_safe_copy(os.path.join(BASE_DIR, "cascade", "haarcascade_frontalface_default.xml"))
     
-    try:
-        model = load_model_checkpoint(MODEL_PATH, device=device)
-        model_loaded = True
-        model_error = None
-    except (FileNotFoundError, OSError, RuntimeError, ValueError) as e:
+    if os.path.exists(MODEL_PATH):
+        try:
+            model = load_model_checkpoint(MODEL_PATH, device=device)
+            model_loaded = True
+            model_error = None
+        except Exception as e:
+            model = None
+            model_loaded = False
+            model_error = str(e)
+    else:
         model = None
         model_loaded = False
-        model_error = str(e)
+        model_error = "Model weights not found. Please run training (python train_transfer.py)."
 
     try:
         cascade = resolve_cascade_classifier(cascade_path)
@@ -794,7 +655,7 @@ def render_image_detection(model, cascade, transform, device, model_loaded: bool
     """, unsafe_allow_html=True)
 
     if not model_loaded:
-        st.warning("The detection model is unavailable. See the model error above.")
+        st.warning("⚠️ Model checkpoint not found at models/best_resnet18_deepfake.pth. Please train the model first.")
         return
 
     # Compact 3-column layout
@@ -823,13 +684,9 @@ def render_image_detection(model, cascade, transform, device, model_loaded: bool
     image_to_process = None
     if uploaded_file is not None:
         try:
-            image_to_process = _load_safe_image(io.BytesIO(uploaded_file.getvalue()))
-        except (ValueError, OSError):
-            logger.exception("Image validation failed for uploaded file %r.", uploaded_file.name)
-            st.error(
-                "Image rejected. Upload a valid JPEG, PNG, or WEBP image smaller than "
-                f"{MAX_IMAGE_PIXELS:,} pixels."
-            )
+            image_to_process = Image.open(uploaded_file).convert("RGB")
+        except Exception as e:
+            st.error(f"Failed to read uploaded image: {e}")
     elif sample_choice != "(None)":
         sample_map = {
             "Real Portrait Sample": os.path.join(SAMPLE_IMAGES_DIR, "real_face_01.jpg"),
@@ -838,13 +695,7 @@ def render_image_detection(model, cascade, transform, device, model_loaded: bool
         }
         target_path = sample_map[sample_choice]
         if os.path.exists(target_path):
-            try:
-                image_to_process = _load_safe_image(target_path)
-            except (ValueError, OSError):
-                logger.exception("Image validation failed for sample %r.", target_path)
-                st.error("The selected sample image could not be loaded. Details were logged.")
-        else:
-            st.warning("The selected sample image is not available.")
+            image_to_process = Image.open(target_path).convert("RGB")
 
     with col_preview:
         st.markdown('<div class="glass-card">', unsafe_allow_html=True)
@@ -862,65 +713,95 @@ def render_image_detection(model, cascade, transform, device, model_loaded: bool
         analyze_clicked = st.button("🔍 ANALYZE IMAGE", use_container_width=True)
 
         if image_to_process is not None and analyze_clicked:
-            try:
-                analysis = _analyze_single_face(image_to_process, cascade, transform, model, device)
-            except (cv2.error, OSError, RuntimeError, ValueError):
-                logger.exception(
-                    "Image analysis failed for %r during face detection, preprocessing, or inference.",
-                    uploaded_file.name if uploaded_file is not None else sample_choice,
-                )
-                st.error(
-                    "Image analysis failed. Try a different supported image; "
-                    "the detailed error was logged."
-                )
+            # Convert to OpenCV BGR
+            np_img = np.array(image_to_process)
+            cv_img = cv2.cvtColor(np_img, cv2.COLOR_RGB2BGR)
+
+            # Detect face
+            gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+            faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+            if len(faces) == 0:
+                faces = cascade.detectMultiScale(gray, scaleFactor=1.05, minNeighbors=3, minSize=(25, 25))
+
+            if len(faces) == 0:
+                st.error("❌ **No detectable face found.**\nPlease upload an image containing a clear, visible human face.")
             else:
-                if analysis["status"] == "no_face":
-                    st.warning(
-                        "No face was detected. No authenticity verdict was generated; "
-                        "try a clearer image with a visible face."
-                    )
-                elif analysis["status"] == "multiple_faces":
-                    st.warning(
-                        f"{analysis['face_count']} faces were detected. No authenticity verdict "
-                        "was generated; upload an image with one clearly visible face."
-                    )
+                # Select largest face
+                largest_face = max(faces, key=lambda rect: rect[2] * rect[3])
+                x, y, w, h = largest_face
+
+                # Margin
+                mx, my = int(w * 0.15), int(h * 0.15)
+                ih, iw = cv_img.shape[:2]
+                x1, y1 = max(0, x - mx), max(0, y - my)
+                x2, y2 = min(iw, x + w + mx), min(ih, y + h + my)
+                face_crop = cv_img[y1:y2, x1:x2]
+
+                # Inference
+                face_rgb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
+                pil_crop = Image.fromarray(face_rgb)
+                tensor = transform(pil_crop).unsqueeze(0).to(device)
+
+                with torch.no_grad():
+                    start_t = time.time()
+                    logits = model(tensor)
+                    latency = (time.time() - start_t) * 1000.0
+                    probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
+
+                # 0 = FAKE, 1 = REAL
+                fake_prob = float(probs[0])
+                real_prob = float(probs[1])
+
+                # Uncertainty thresholds
+                THRESHOLD_FAKE = 0.65
+                THRESHOLD_REAL = 0.35
+
+                if fake_prob >= THRESHOLD_FAKE:
+                    pred_class = "FAKE"
+                    badge_html = '<div class="badge-fake">MANIPULATED / FAKE</div>'
+                    confidence = fake_prob
+                elif fake_prob <= THRESHOLD_REAL:
+                    pred_class = "REAL"
+                    badge_html = '<div class="badge-real">AUTHENTIC / REAL</div>'
+                    confidence = real_prob
                 else:
-                    pred_class = analysis["prediction"]
-                    confidence = analysis["confidence"]
-                    fake_prob = analysis["fake_prob"]
-                    real_prob = analysis["real_prob"]
-                    latency = analysis["latency"]
-                    badge_html = (
-                        '<div class="badge-fake">MANIPULATED / FAKE</div>'
-                        if pred_class == "FAKE"
-                        else '<div class="badge-real">AUTHENTIC / REAL</div>'
-                    )
+                    pred_class = "UNCERTAIN"
+                    badge_html = '<div class="badge-uncertain">UNCERTAIN</div>'
+                    confidence = max(fake_prob, real_prob)
+                
+                save_detection(
+                    username=st.session_state.username,
+                    file_name=(
+                        uploaded_file.name
+                        if uploaded_file is not None
+                        else sample_choice
+                    ),
+                    media_type="image",
+                    prediction=pred_class,
+                    confidence=confidence
+                )
 
-                    save_detection(
-                        username=st.session_state.username,
-                        file_name=uploaded_file.name if uploaded_file is not None else sample_choice,
-                        media_type="image",
-                        prediction=pred_class,
-                        confidence=confidence,
-                    )
 
-                    st.markdown(
-                        f"<div style='text-align: center; margin: 16px 0;'>{badge_html}</div>",
-                        unsafe_allow_html=True,
-                    )
-                    st.markdown(f"**Confidence:** `{confidence * 100:.1f}%`")
-                    st.caption("Faces analyzed: 1")
-                    st.markdown(f"Fake Probability (`{fake_prob * 100:.1f}%`):")
-                    st.progress(fake_prob)
-                    st.markdown(f"Real Probability (`{real_prob * 100:.1f}%`):")
-                    st.progress(real_prob)
-                    st.markdown(f"""
-                    <div style="display: flex; justify-content: space-between; font-size: 0.8rem; color: #64748b; margin-top: 14px; border-top: 1px solid rgba(255,255,255,0.06); padding-top: 8px;">
-                        <span>Faces Analyzed: 1</span>
-                        <span>Inference: {latency:.1f} ms</span>
-                        <span>Device: {str(device).upper()}</span>
-                    </div>
-                    """, unsafe_allow_html=True)
+                st.markdown(f"<div style='text-align: center; margin: 16px 0;'>{badge_html}</div>", unsafe_allow_html=True)
+                
+                if pred_class == "UNCERTAIN":
+                    st.caption("⚠️ The model does not possess sufficient statistical confidence to confirm authenticity.")
+
+                # Probability bars
+                st.markdown(f"**Confidence:** `{confidence * 100:.1f}%`")
+                st.markdown(f"Fake Probability (`{fake_prob * 100:.1f}%`):")
+                st.progress(float(fake_prob))
+
+                st.markdown(f"Real Probability (`{real_prob * 100:.1f}%`):")
+                st.progress(float(real_prob))
+
+                st.markdown(f"""
+                <div style="display: flex; justify-content: space-between; font-size: 0.8rem; color: #64748b; margin-top: 14px; border-top: 1px solid rgba(255,255,255,0.06); padding-top: 8px;">
+                    <span>Face Box: {w}x{h} px</span>
+                    <span>Inference: {latency:.1f} ms</span>
+                    <span>Device: {str(device).upper()}</span>
+                </div>
+                """, unsafe_allow_html=True)
         elif image_to_process is not None:
             st.info("Image ready. Select Analyze Image to run the forensic inspection.")
         else:
@@ -945,7 +826,7 @@ def render_video_detection(model, cascade, transform, device, model_loaded: bool
     """, unsafe_allow_html=True)
 
     if not model_loaded:
-        st.warning("The detection model is unavailable. See the model error above.")
+        st.warning("⚠️ Model checkpoint not found at models/best_resnet18_deepfake.pth. Please train the model first.")
         return
 
     col_input, col_analysis = st.columns([1.1, 1.4], gap="medium")
@@ -1244,8 +1125,6 @@ def main():
         render_navbar()
 
         model, cascade, transform, device, model_loaded, model_error = load_deepfake_detector()
-        if model_error:
-            st.error(f"Model unavailable: {model_error}")
 
         if st.session_state.current_page == "Dashboard":
             render_dashboard(model_loaded, device)
