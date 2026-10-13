@@ -15,7 +15,6 @@ Architecture:
 """
 
 import os
-import pickle
 import torch
 import torch.nn as nn
 import torchvision.models as models
@@ -74,77 +73,20 @@ def load_model_checkpoint(
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"Model checkpoint not found at: {checkpoint_path}")
 
-    try:
-        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    except (pickle.UnpicklingError, EOFError) as exc:
-        raise ValueError(
-            f"Invalid or unsupported model checkpoint format at: {checkpoint_path}"
-        ) from exc
-
-    if not isinstance(checkpoint, dict):
-        raise ValueError(
-            "Invalid checkpoint format: expected a state dictionary or a checkpoint "
-            "dictionary containing 'model_state_dict'."
-        )
-
-    if "architecture" in checkpoint and checkpoint["architecture"] != "ResNet18":
-        raise ValueError(
-            "Incompatible checkpoint architecture: expected 'ResNet18', "
-            f"got {checkpoint['architecture']!r}."
-        )
-
-    if "class_names" in checkpoint:
-        class_names = checkpoint["class_names"]
-        if not isinstance(class_names, dict):
-            raise ValueError("Invalid checkpoint metadata: 'class_names' must be a dictionary.")
-        try:
-            normalized_class_names = {int(index): str(name).upper() for index, name in class_names.items()}
-        except (TypeError, ValueError) as exc:
-            raise ValueError("Invalid checkpoint metadata: 'class_names' must map class indexes to names.") from exc
-        if normalized_class_names != LABEL_MAP:
-            raise ValueError(
-                "Incompatible checkpoint class mapping: expected {0: 'FAKE', 1: 'REAL'}, "
-                f"got {normalized_class_names!r}."
-            )
-
-    if "model_state_dict" in checkpoint:
+    # Build model without pretrained weights since we will load our own state_dict
+    model = get_model(num_classes=2, dropout_rate=dropout_rate, pretrained=False)
+    
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    
+    # Check if checkpoint is a state_dict or a dict containing 'state_dict' or 'model_state_dict'
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
         state_dict = checkpoint["model_state_dict"]
-    elif "state_dict" in checkpoint:
+    elif isinstance(checkpoint, dict) and "state_dict" in checkpoint:
         state_dict = checkpoint["state_dict"]
     else:
         state_dict = checkpoint
-
-    if not isinstance(state_dict, dict) or not state_dict:
-        raise ValueError(
-            "Invalid checkpoint format: the model weights must be a non-empty state dictionary."
-        )
-    if not all(isinstance(value, torch.Tensor) for value in state_dict.values()):
-        raise ValueError(
-            "Invalid checkpoint format: the selected state dictionary contains non-tensor values."
-        )
-
-    checkpoint_dropout = checkpoint.get("dropout_rate", dropout_rate)
-    if (
-        not isinstance(checkpoint_dropout, (int, float))
-        or isinstance(checkpoint_dropout, bool)
-        or not 0 <= checkpoint_dropout < 1
-    ):
-        raise ValueError(
-            f"Invalid checkpoint dropout_rate: expected a number in [0, 1), got {checkpoint_dropout!r}."
-        )
-
-    # Training saves DeepfakeResNet18 weights, whose keys are prefixed with "backbone.".
-    model = get_model(num_classes=2, dropout_rate=float(checkpoint_dropout), pretrained=False)
-    try:
-        model.load_state_dict(state_dict)
-    except RuntimeError as exc:
-        raise RuntimeError(
-            "Checkpoint weights are incompatible with the trained DeepfakeResNet18 "
-            "architecture (ResNet18 backbone, Dropout + 512-to-2 classifier). "
-            "Ensure the deployed model_def.py matches the training code. "
-            f"Details: {exc}"
-        ) from exc
-
+        
+    model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
     return model
