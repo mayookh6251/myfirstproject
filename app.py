@@ -719,55 +719,85 @@ def render_image_detection(model, cascade, transform, device, model_loaded: bool
 
             # Detect face
             gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
-            faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
-            if len(faces) == 0:
-                faces = cascade.detectMultiScale(gray, scaleFactor=1.05, minNeighbors=3, minSize=(25, 25))
+            equalized_gray = cv2.equalizeHist(gray)
+            face_candidates = []
+            for detection_image, scale_factor, min_neighbors, min_size in (
+                (gray, 1.1, 5, (30, 30)),
+                (equalized_gray, 1.03, 3, (15, 15)),
+            ):
+                detected = cascade.detectMultiScale(
+                    detection_image,
+                    scaleFactor=scale_factor,
+                    minNeighbors=min_neighbors,
+                    minSize=min_size,
+                )
+                face_candidates.extend(detected)
+
+            # Keep the strongest-sized box when detector passes overlap on one face.
+            face_candidates.sort(key=lambda rect: rect[2] * rect[3], reverse=True)
+            faces = []
+            for candidate in face_candidates:
+                x, y, w, h = candidate
+                duplicate = False
+                for kept_x, kept_y, kept_w, kept_h in faces:
+                    intersection_w = max(0, min(x + w, kept_x + kept_w) - max(x, kept_x))
+                    intersection_h = max(0, min(y + h, kept_y + kept_h) - max(y, kept_y))
+                    intersection = intersection_w * intersection_h
+                    smaller_area = min(w * h, kept_w * kept_h)
+                    if smaller_area and intersection / smaller_area > 0.8:
+                        duplicate = True
+                        break
+                if not duplicate:
+                    faces.append(candidate)
 
             if len(faces) == 0:
                 st.error("❌ **No detectable face found.**\nPlease upload an image containing a clear, visible human face.")
             else:
-                # Select largest face
-                largest_face = max(faces, key=lambda rect: rect[2] * rect[3])
-                x, y, w, h = largest_face
-
-                # Margin
-                mx, my = int(w * 0.15), int(h * 0.15)
                 ih, iw = cv_img.shape[:2]
-                x1, y1 = max(0, x - mx), max(0, y - my)
-                x2, y2 = min(iw, x + w + mx), min(ih, y + h + my)
-                face_crop = cv_img[y1:y2, x1:x2]
+                face_tensors = []
+                for x, y, w, h in faces:
+                    mx, my = int(w * 0.15), int(h * 0.15)
+                    x1, y1 = max(0, x - mx), max(0, y - my)
+                    x2, y2 = min(iw, x + w + mx), min(ih, y + h + my)
+                    face_crop = cv_img[y1:y2, x1:x2]
+                    if face_crop.size == 0:
+                        continue
 
-                # Inference
-                face_rgb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
-                pil_crop = Image.fromarray(face_rgb)
-                tensor = transform(pil_crop).unsqueeze(0).to(device)
+                    face_rgb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
+                    face_tensors.append(transform(Image.fromarray(face_rgb)))
+
+                if not face_tensors:
+                    st.error("❌ **No usable face crops found.** Please upload a clearer image.")
+                    st.stop()
+
+                batch = torch.stack(face_tensors).to(device)
 
                 with torch.no_grad():
                     start_t = time.time()
-                    logits = model(tensor)
+                    logits = model(batch)
                     latency = (time.time() - start_t) * 1000.0
-                    probs = torch.softmax(logits, dim=1).cpu().numpy()[0]
+                    face_probs = torch.softmax(logits, dim=1).cpu().numpy()
 
-                # 0 = FAKE, 1 = REAL
-                fake_prob = float(probs[0])
-                real_prob = float(probs[1])
+                # Class 0 = FAKE, class 1 = REAL; each face gets one vote.
+                face_votes = np.argmax(face_probs, axis=1)
+                fake_votes = int(np.count_nonzero(face_votes == 0))
+                real_votes = int(np.count_nonzero(face_votes == 1))
+                face_count = len(face_votes)
+                fake_prob = float(face_probs[:, 0].mean())
+                real_prob = float(face_probs[:, 1].mean())
 
-                # Uncertainty thresholds
-                THRESHOLD_FAKE = 0.65
-                THRESHOLD_REAL = 0.35
-
-                if fake_prob >= THRESHOLD_FAKE:
-                    pred_class = "FAKE"
-                    badge_html = '<div class="badge-fake">MANIPULATED / FAKE</div>'
-                    confidence = fake_prob
-                elif fake_prob <= THRESHOLD_REAL:
+                if real_votes > fake_votes:
                     pred_class = "REAL"
                     badge_html = '<div class="badge-real">AUTHENTIC / REAL</div>'
-                    confidence = real_prob
+                    confidence = real_votes / face_count
+                elif fake_votes > real_votes:
+                    pred_class = "FAKE"
+                    badge_html = '<div class="badge-fake">MANIPULATED / FAKE</div>'
+                    confidence = fake_votes / face_count
                 else:
                     pred_class = "UNCERTAIN"
                     badge_html = '<div class="badge-uncertain">UNCERTAIN</div>'
-                    confidence = max(fake_prob, real_prob)
+                    confidence = max(fake_votes, real_votes) / face_count
                 
                 save_detection(
                     username=st.session_state.username,
@@ -789,6 +819,7 @@ def render_image_detection(model, cascade, transform, device, model_loaded: bool
 
                 # Probability bars
                 st.markdown(f"**Confidence:** `{confidence * 100:.1f}%`")
+                st.caption(f"Faces analyzed: {face_count} | Real votes: {real_votes} | Fake votes: {fake_votes}")
                 st.markdown(f"Fake Probability (`{fake_prob * 100:.1f}%`):")
                 st.progress(float(fake_prob))
 
@@ -797,7 +828,7 @@ def render_image_detection(model, cascade, transform, device, model_loaded: bool
 
                 st.markdown(f"""
                 <div style="display: flex; justify-content: space-between; font-size: 0.8rem; color: #64748b; margin-top: 14px; border-top: 1px solid rgba(255,255,255,0.06); padding-top: 8px;">
-                    <span>Face Box: {w}x{h} px</span>
+                    <span>Faces Analyzed: {face_count}</span>
                     <span>Inference: {latency:.1f} ms</span>
                     <span>Device: {str(device).upper()}</span>
                 </div>
