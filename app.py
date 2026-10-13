@@ -12,17 +12,14 @@ import streamlit as st
 
 import torch
 
-import torch.nn as nn
-
-
-
 from PIL import Image
 
-from torchvision import models, transforms
+from torchvision import transforms
 
 
 
 from auth import authenticate_user, register_user
+from model_def import load_model_checkpoint
 
 
 
@@ -1031,38 +1028,12 @@ st.html("""
 @st.cache_resource
 
 def load_model():
-
-    model = models.resnet18(weights=None)
-
-    features = model.fc.in_features
-
-    model.fc = nn.Sequential(
-
-        nn.Dropout(0.4),
-
-        nn.Linear(features, 2),
-
+    checkpoint_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "models",
+        "best_resnet18_deepfake.pth",
     )
-
-
-
-    model.load_state_dict(
-
-        torch.load(
-
-            "models/best_resnet18_deepfake.pth",
-
-            map_location=DEVICE,
-
-        )
-
-    )
-
-    model.to(DEVICE)
-
-    model.eval()
-
-    return model
+    return load_model_checkpoint(checkpoint_path, device=DEVICE)
 
 
 
