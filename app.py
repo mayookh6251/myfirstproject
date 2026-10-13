@@ -1,1172 +1,2535 @@
-
-
 import os
-import io
-import time
+
 import tempfile
-import shutil
+
+
+
 import cv2
+
 import numpy as np
-import pandas as pd
-from PIL import Image, ImageDraw
-import torch
+
 import streamlit as st
 
-from auth import init_db, register_user, authenticate_user
-from model_def import get_model, load_model_checkpoint, LABEL_MAP
-from extract_faces import resolve_cascade_classifier, detect_and_crop_face
-from dataset_loader import get_inference_transform
-from evaluate_video import predict_video
+import torch
 
-#supabase client
-@st.cache_resource
-def get_supabase():
-    from supabase import create_client
-
-    return create_client(
-        st.secrets["SUPABASE_URL"],
-        st.secrets["SUPABASE_KEY"]
-    )
-
-def save_detection(username, file_name, media_type,
-                   prediction, confidence=None):
-    try:
-        db = get_supabase()
-
-        record = {
-            "username": username,
-            "file_name": file_name,
-            "media_type": media_type,
-            "prediction": prediction,
-            "confidence": (
-                float(confidence)
-                if confidence is not None else None
-            ),
-        }
-
-        db.table("detection_history").insert(
-            record
-        ).execute()
-
-        return True
-
-    except Exception as exc:
-        st.warning(f"Detection history could not be saved: {exc}")
-        return False
+import torch.nn as nn
 
 
 
-# ==============================================================================
-# Page Configuration
-# ==============================================================================
+from PIL import Image
+
+from torchvision import models, transforms
+
+
+
+from auth import authenticate_user, register_user
+
+
+
+
+
+# ============================================================
+
+# PAGE CONFIG
+
+# ============================================================
+
+
+
 st.set_page_config(
-    page_title="Aletheia AI - Deepfake Detection System",
+
+    page_title="DeepGuard | AI Media Security",
+
     page_icon="🛡️",
+
     layout="wide",
-    initial_sidebar_state="collapsed"
+
+    initial_sidebar_state="collapsed",
+
 )
 
-# Initialize database
-init_db()
-
-# Default paths
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(BASE_DIR, "models", "best_resnet18_deepfake.pth")
-RESULTS_DIR = os.path.join(BASE_DIR, "results")
-SAMPLE_IMAGES_DIR = os.path.join(BASE_DIR, "sample_images")
-SAMPLE_VIDEOS_DIR = os.path.join(BASE_DIR, "ffpp_videos")
 
 
-def ensure_ascii_safe_copy(path: str) -> str:
-    """Copy non-ASCII file paths to a temp folder so OpenCV can read them reliably."""
-    if not path or not os.path.exists(path):
-        return path
-
-    abs_path = os.path.abspath(path)
-    if all(ord(ch) < 128 for ch in abs_path):
-        return abs_path
-
-    safe_dir = os.path.join(tempfile.gettempdir(), "deepguard_ai")
-    os.makedirs(safe_dir, exist_ok=True)
-    safe_target = os.path.join(safe_dir, os.path.basename(abs_path))
-
-    if not os.path.exists(safe_target) or os.path.getsize(safe_target) != os.path.getsize(abs_path):
-        shutil.copy2(abs_path, safe_target)
-
-    return safe_target
 
 
-# ==============================================================================
-# Cached Resources
-# ==============================================================================
-@st.cache_resource
-def load_deepfake_detector():
-    """Loads and caches the ResNet18 model and face cascade classifier."""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# ============================================================
 
-    cascade_path = ensure_ascii_safe_copy(os.path.join(BASE_DIR, "cascade", "haarcascade_frontalface_default.xml"))
-    
-    try:
-        model = load_model_checkpoint(MODEL_PATH, device=device)
-        model_loaded = True
-        model_error = None
-    except (FileNotFoundError, OSError, RuntimeError, ValueError) as e:
-        model = None
-        model_loaded = False
-        model_error = str(e)
+# DEVICE / SESSION
 
-    try:
-        cascade = resolve_cascade_classifier(cascade_path)
-    except Exception as e:
-        cascade = None
-        st.error(f"Error loading face detector: {e}")
-
-    transform = get_inference_transform()
-    return model, cascade, transform, device, model_loaded, model_error
+# ============================================================
 
 
-# ==============================================================================
-# Futuristic CSS Styling
-# ==============================================================================
-def inject_custom_css():
-    st.markdown("""
-    <style>
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+
+if "logged_in" not in st.session_state:
+
+    st.session_state.logged_in = False
+
+
+
+if "username" not in st.session_state:
+
+    st.session_state.username = ""
+
+
+
+if "page" not in st.session_state:
+
+    st.session_state.page = "Dashboard"
+
+
+
+
+
+# ============================================================
+
+# GLOBAL STYLE
+
+# ============================================================
+
+
+
+st.html("""
+
+  <style>
+
     /* Google Fonts */
+
     @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Rajdhani:wght@500;600;700&family=Inter:wght@300;400;500;600&display=swap');
 
-    /* Dark forensic theme */
+
+
+    /* Global Dark Theme */
+
     .stApp {
+
         background-color: #070b12;
-        background-image:
+
+        background-image:&#x20;
+
             radial-gradient(circle at 15% 15%, rgba(0, 229, 255, 0.05) 0%, transparent 40%),
+
             radial-gradient(circle at 85% 85%, rgba(121, 40, 202, 0.06) 0%, transparent 40%);
+
         color: #e2e8f0;
+
         font-family: 'Inter', sans-serif;
+
     }
-    
+
+
 
     /* Remove excess Streamlit margins while keeping controls accessible */
+
     .block-container {
+
         padding-top: 2rem !important;
+
         padding-bottom: 2rem !important;
+
         max-width: 1400px !important;
+
     }
 
-    /* Glass cards */
+
+
+    /* Glowing Glassmorphism Card */
+
     .glass-card {
+
         background: rgba(13, 21, 38, 0.75);
+
         backdrop-filter: blur(14px);
+
         -webkit-backdrop-filter: blur(14px);
+
         border: 1px solid rgba(0, 229, 255, 0.18);
-        border-radius: 28px;
+
+        border-radius: 14px;
+
         padding: 24px;
-        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
-        transition: all 0.25s ease;
-        z-index: 1;
-        margin-top: 20px;
-    }
-    
-    
-    .auth-panel {
-        max-width: 440px;
-        width: 100%;
-        margin-left: auto;
-        min-height: 330px;
-        padding: 24px;
-        box-sizing: border-box;
-        background: rgba(13, 21, 38, 0.82);
-        border: 1px solid rgba(0, 229, 255, 0.18);
-        border-radius: 28px;
-        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
-        margin-top:20px;
+
+        box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.45);
+
+        transition: all 0.3s ease;
+
     }
 
-    .st-key-auth_panel {
-        max-width: 440px;
-        width: 100%;
-        margin-left: auto;
-        min-height: 330px;
-        padding: 24px;
-        box-sizing: border-box;
-        background: rgba(13, 21, 38, 0.75);
-        backdrop-filter: blur(14px);
-        -webkit-backdrop-filter: blur(14px);
-        border: 1px solid rgba(0, 229, 255, 0.18);
-        border-radius: 28px;
-        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
-        margin-top:20px;
+    .glass-card:hover {
+
+        border-color: rgba(0, 229, 255, 0.35);
+
+        box-shadow: 0 10px 36px 0 rgba(0, 229, 255, 0.12);
+
+    }
+
+
+
+    /* Hero Brand Text */
+
+    .brand-title {
+
+        font-family: 'Orbitron', sans-serif;
+
+        font-size: 2.2rem;
+
+        font-weight: 900;
+
+        letter-spacing: 2px;
+
+        background: linear-gradient(135deg, #00e5ff 0%, #7928ca 100%);
+
+        -webkit-background-clip: text;
+
+        -webkit-text-fill-color: transparent;
+
+        margin-bottom: 8px;
+
+    }
+
+    .tagline {
+
+        font-family: 'Rajdhani', sans-serif;
+
+        font-size: 1.5rem;
+
+        font-weight: 700;
+
+        letter-spacing: 3px;
+
+        color: #f8fafc;
+
+        margin-bottom: 12px;
+
+    }
+
+    .subtagline {
+
+        color: #94a3b8;
+
+        font-size: 0.95rem;
+
+        line-height: 1.6;
+
+    }
+
+
+
+    /* Glowing Status Badges */
+
+    .badge-fake {
+
+        display: inline-block;
+
+        padding: 8px 24px;
+
+        font-family: 'Orbitron', sans-serif;
+
+        font-size: 1.3rem;
+
+        font-weight: 800;
+
+        color: #ff3366;
+
+        background: rgba(255, 51, 102, 0.12);
+
+        border: 2px solid #ff3366;
+
+        border-radius: 8px;
+
+        box-shadow: 0 0 18px rgba(255, 51, 102, 0.4);
+
+        letter-spacing: 2px;
+
+    }
+
+    .badge-real {
+
+        display: inline-block;
+
+        padding: 8px 24px;
+
+        font-family: 'Orbitron', sans-serif;
+
+        font-size: 1.3rem;
+
+        font-weight: 800;
+
+        color: #00ff88;
+
+        background: rgba(0, 255, 136, 0.12);
+
+        border: 2px solid #00ff88;
+
+        border-radius: 8px;
+
+        box-shadow: 0 0 18px rgba(0, 255, 136, 0.4);
+
+        letter-spacing: 2px;
+
+    }
+
+    .badge-uncertain {
+
+        display: inline-block;
+
+        padding: 8px 24px;
+
+        font-family: 'Orbitron', sans-serif;
+
+        font-size: 1.3rem;
+
+        font-weight: 800;
+
+        color: #ffb800;
+
+        background: rgba(255, 184, 0, 0.12);
+
+        border: 2px solid #ffb800;
+
+        border-radius: 8px;
+
+        box-shadow: 0 0 18px rgba(255, 184, 0, 0.4);
+
+        letter-spacing: 2px;
+
+    }
+
+
+
+    /* Metric Cards */
+
+    .metric-box {
+
+        background: rgba(15, 23, 42, 0.6);
+
+        border: 1px solid rgba(255, 255, 255, 0.08);
+
+        border-radius: 10px;
+
+        padding: 14px;
+
+        text-align: center;
+
+        margin-bottom: 10px;
+
+    }
+
+    .metric-value {
+
+        font-family: 'Orbitron', sans-serif;
+
+        font-size: 1.4rem;
+
+        font-weight: 700;
+
+        color: #00e5ff;
+
+    }
+
+    .metric-label {
+
+        font-size: 0.78rem;
+
+        text-transform: uppercase;
+
+        letter-spacing: 1.2px;
+
+        color: #94a3b8;
+
+    }
+
+
+
+    /* Shared dashboard/card blocks */
+
+    .dark-card {
+
+        background: rgba(12, 17, 29, 0.78);
+
+        border: 1px solid rgba(148, 163, 184, 0.12);
+
+        border-radius: 16px;
+
+        padding: 22px 20px;
+
+        box-shadow: 0 12px 24px rgba(0, 0, 0, 0.22);
+
+        backdrop-filter: blur(10px);
+
+        -webkit-backdrop-filter: blur(10px);
+
+    }
+
+    .card-icon {
+
+        font-size: 2rem;
+
+        color: #00e5ff;
+
+        margin-bottom: 10px;
+
+        display: inline-block;
+
+    }
+
+    .card-title {
+
+        font-family: 'Orbitron', sans-serif;
+
+        font-size: 1rem;
+
+        font-weight: 700;
+
+        letter-spacing: 0.12em;
+
+        text-transform: uppercase;
+
+        color: #f8fafc;
+
+        margin-bottom: 8px;
+
+    }
+
+    .card-description {
+
+        color: #a9b5c9;
+
+        font-size: 0.95rem;
+
+        line-height: 1.65;
+
+    }
+
+
+
+    .eyebrow {
+
+        font-family: 'Orbitron', sans-serif;
+
+        font-size: 0.7rem;
+
+        font-weight: 700;
+
+        letter-spacing: 0.22em;
+
+        text-transform: uppercase;
+
+        color: #7dd3fc;
+
+        margin-bottom: 10px;
+
+    }
+
+    .page-title {
+
+        font-family: 'Orbitron', sans-serif;
+
+        font-size: 2.5rem;
+
+        line-height: 1.06;
+
+        font-weight: 800;
+
+        letter-spacing: 0.04em;
+
+        color: #f8fafc;
+
+        margin-bottom: 12px;
+
+    }
+
+    .page-title span {
+
+        color: #00e5ff;
+
+    }
+
+    .page-description {
+
+        color: #a8b0c0;
+
+        font-size: 1rem;
+
+        line-height: 1.7;
+
+        max-width: 720px;
+
+    }
+
+
+
+    /* Navbar / header */
+
+    .navbar {
+
+        display: flex;
+
+        justify-content: space-between;
+
+        align-items: center;
+
+        padding: 12px 24px;
+
+        background: rgba(13, 21, 38, 0.85);
+
+        backdrop-filter: blur(12px);
+
+        border: 1px solid rgba(0, 229, 255, 0.2);
+
+        border-radius: 12px;
+
+        margin-bottom: 24px;
+
+    }
+
+    .brand {
+
+        display: flex;
+
+        align-items: center;
+
+        gap: 12px;
+
+    }
+
+    .brand-icon {
+
+        width: 38px;
+
+        height: 38px;
+
+        border-radius: 12px;
+
+        display: grid;
+
+        place-items: center;
+
+        font-size: 1.25rem;
+
+        background: linear-gradient(135deg, rgba(0, 229, 255, 0.22), rgba(121, 40, 202, 0.22));
+
+        border: 1px solid rgba(0, 229, 255, 0.28);
+
+    }
+
+    .brand-name {
+
+        font-family: 'Orbitron', sans-serif;
+
+        font-size: 1.05rem;
+
+        font-weight: 800;
+
+        letter-spacing: 0.12em;
+
+        text-transform: uppercase;
+
+        color: #f8fafc;
+
+    }
+
+    .brand-sub {
+
+        font-size: 0.7rem;
+
+        letter-spacing: 0.14em;
+
+        text-transform: uppercase;
+
+        color: #93a3be;
+
+    }
+
+
+
+    /* Result cards */
+
+    .result {
+
+        background: rgba(12, 18, 30, 0.8);
+
+        border: 1px solid rgba(255, 255, 255, 0.08);
+
+        border-radius: 14px;
+
+        padding: 18px 20px;
+
+        min-height: 140px;
+
+        box-shadow: 0 10px 20px rgba(0, 0, 0, 0.2);
+
+    }
+
+    .result-icon {
+
+        font-size: 2.2rem;
+
+        margin-bottom: 10px;
+
+    }
+
+    .result-label {
+
+        font-family: 'Orbitron', sans-serif;
+
+        font-size: 1.5rem;
+
+        font-weight: 800;
+
+        letter-spacing: 0.08em;
+
+        text-transform: uppercase;
+
+        color: #f8fafc;
+
+        margin-bottom: 6px;
+
+    }
+
+    .result-confidence {
+
+        color: #9fb2d1;
+
+        font-size: 0.8rem;
+
+        letter-spacing: 0.08em;
+
+        text-transform: uppercase;
+
+    }
+
+
+
+    /* Background animation */
+
+    .morph-container {
+
+        position: fixed;
+
+        inset: 0;
+
+        pointer-events: none;
+
+        overflow: hidden;
+
+        z-index: 0;
+
+    }
+
+    .morph {
+
+        position: absolute;
+
+        border-radius: 50%;
+
+        filter: blur(28px);
+
+        opacity: 0.2;
+
+        animation: floatPulse 18s ease-in-out infinite;
+
+    }
+
+    .morph.one {
+
+        width: 220px;
+
+        height: 220px;
+
+        background: rgba(0, 229, 255, 0.32);
+
+        top: 12%;
+
+        left: 8%;
+
+    }
+
+    .morph.two {
+
+        width: 260px;
+
+        height: 260px;
+
+        background: rgba(121, 40, 202, 0.28);
+
+        bottom: 16%;
+
+        right: 12%;
+
+        animation-delay: 4s;
+
+    }
+
+    .morph.three {
+
+        width: 200px;
+
+        height: 200px;
+
+        background: rgba(0, 255, 136, 0.16);
+
+        top: 40%;
+
+        right: 28%;
+
+        animation-delay: 7s;
+
+    }
+
+    @keyframes floatPulse {
+
+        0%, 100% { transform: translate3d(0, 0, 0) scale(1); }
+
+        50% { transform: translate3d(12px, -18px, 0) scale(1.08); }
+
+    }
+
+    @keyframes pageIn {
+
+        from { opacity: 0; transform: translateY(5px); }
+
+        to { opacity: 1; transform: translateY(0); }
+
+    }
+
+
+
+    /* Auth layout */
+
+    .auth-brand-card {
+
+        position: relative;
+
+        overflow: hidden;
+
+        min-height: 560px;
+
+        background: linear-gradient(135deg, rgba(12, 17, 29, 0.9), rgba(18, 25, 42, 0.8));
+
+        border: 1px solid rgba(0, 229, 255, 0.15);
+
+        border-radius: 18px;
+
+        padding: 28px;
+
+    }
+
+    .auth-glow {
+
+        position: absolute;
+
+        inset: 0;
+
+        background: radial-gradient(circle at 20% 20%, rgba(0, 229, 255, 0.12), transparent 35%);
+
+    }
+
+    .auth-label {
+
+        position: relative;
+
+        z-index: 1;
+
+        font-family: 'Orbitron', sans-serif;
+
+        font-size: 0.7rem;
+
+        letter-spacing: 0.24em;
+
+        color: #7dd3fc;
+
+        margin-bottom: 24px;
+
+    }
+
+    .auth-brand-center {
+
+        position: relative;
+
+        z-index: 1;
+
+        display: flex;
+
+        flex-direction: column;
+
+        justify-content: center;
+
+        min-height: 360px;
+
     }
 
     .auth-title {
+
         font-family: 'Orbitron', sans-serif;
-        font-size: 1.3rem;
-        font-weight: 700;
-        color: #00e5ff;
-        margin-bottom: 4px;
-    }
 
-    .stTabs [data-testid="stBaseButton-secondary"], .stTabs [role="tab"] {
-        min-height: 34px !important;
-        padding-top: 8px !important;
-        padding-bottom: 8px !important;
-        border-radius: 12px !important;
-        font-size: 0.78rem !important;
-        letter-spacing: 1px;
-        color: #94a3b8 !important;
-        background: rgba(10, 16, 29, 0.75) !important;
-    }
-    .stTabs [role="tab"][aria-selected="true"] {
-        background: rgba(0, 229, 255, 0.16) !important;
-        color: #ffffff !important;
-    }
-    .stForm {
-        margin-top: 0 !important;
-    }
-    .glass-card:hover {
-        border-color: rgba(0, 229, 255, 0.35);
-        box-shadow: 0 10px 36px rgba(0, 229, 255, 0.12);
-    }
+        font-size: clamp(2.4rem, 4vw, 4.2rem);
 
-    /* Hero Brand Text */
-    .brand-title {
-        font-family: 'Inter', sans-serif;
-        font-size: 2.2rem;
-        font-weight: 700;
-        letter-spacing: -0.06em;
-        color: #00e5ff;
-        margin-bottom: 8px;
-    }
-    .tagline {
-        font-family: 'Inter', sans-serif;
-        font-size: 1.5rem;
-        font-weight: 600;
-        letter-spacing: -0.05em;
+        font-weight: 800;
+
+        letter-spacing: 0.08em;
+
+        line-height: 0.95;
+
         color: #f8fafc;
-        margin-bottom: 12px;
-    }
-    .subtagline {
-        color: #94a3b8;
-        font-size: 0.98rem;
-        line-height: 1.7;
+
+        margin-bottom: 18px;
+
     }
 
-    /* Glowing Status Badges */
-    .badge-fake {
-        display: inline-block;
-        padding: 8px 24px;
-        font-family: 'Orbitron', sans-serif;
-        font-size: 1.3rem;
-        font-weight: 800;
-        color: #ff3366;
-        background: rgba(255, 51, 102, 0.12);
-        border: 2px solid #ff3366;
-        border-radius: 8px;
-        box-shadow: 0 0 18px rgba(255, 51, 102, 0.4);
-        letter-spacing: 2px;
-    }
-    .badge-real {
-        display: inline-block;
-        padding: 8px 24px;
-        font-family: 'Orbitron', sans-serif;
-        font-size: 1.3rem;
-        font-weight: 800;
-        color: #00ff88;
-        background: rgba(0, 255, 136, 0.12);
-        border: 2px solid #00ff88;
-        border-radius: 8px;
-        box-shadow: 0 0 18px rgba(0, 255, 136, 0.4);
-        letter-spacing: 2px;
-    }
-    .badge-uncertain {
-        display: inline-block;
-        padding: 8px 24px;
-        font-family: 'Orbitron', sans-serif;
-        font-size: 1.3rem;
-        font-weight: 800;
-        color: #ffb800;
-        background: rgba(255, 184, 0, 0.12);
-        border: 2px solid #ffb800;
-        border-radius: 8px;
-        box-shadow: 0 0 18px rgba(255, 184, 0, 0.4);
-        letter-spacing: 2px;
-    }
+    .auth-title span {
 
-    /* Metric Cards */
-    .metric-box {
-        background: rgba(15, 23, 42, 0.6);
-        border: 1px solid rgba(255, 255, 255, 0.08);
-        border-radius: 10px;
-        padding: 14px;
-        text-align: center;
-        margin-bottom: 10px;
-    }
-    .metric-value {
-        font-family: 'Orbitron', sans-serif;
-        font-size: 1.4rem;
-        font-weight: 700;
         color: #00e5ff;
-    }
-    .metric-label {
-        font-size: 0.78rem;
-        text-transform: uppercase;
-        letter-spacing: 1.2px;
-        color: #94a3b8;
+
     }
 
-    /* Nav Bar */
-    .navbar {
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        padding: 14px 20px;
-        background: rgba(13, 21, 38, 0.85);
-        backdrop-filter: blur(12px);
-        border: 1px solid rgba(0, 229, 255, 0.2);
-        border-radius: 18px;
-        margin-bottom: 24px;
-        box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
+    .auth-description {
+
+        max-width: 420px;
+
+        color: #c5d0e4;
+
+        font-size: 1rem;
+
+        line-height: 1.7;
+
     }
+
+    .auth-footer {
+
+        position: relative;
+
+        z-index: 1;
+
+        display: flex;
+
+        align-items: center;
+
+        gap: 10px;
+
+        margin-top: 24px;
+
+        color: #8eb2d8;
+
+        font-family: 'Orbitron', sans-serif;
+
+        font-size: 0.7rem;
+
+        letter-spacing: 0.18em;
+
+        text-transform: uppercase;
+
+    }
+
+    .auth-footer i {
+
+        width: 6px;
+
+        height: 6px;
+
+        border-radius: 50%;
+
+        background: rgba(0, 229, 255, 0.8);
+
+        display: inline-block;
+
+    }
+
+    .auth-form-head {
+
+        margin-bottom: 18px;
+
+    }
+
+    .auth-form-kicker {
+
+        font-family: 'Orbitron', sans-serif;
+
+        font-size: 0.68rem;
+
+        letter-spacing: 0.2em;
+
+        color: #7dd3fc;
+
+        margin-bottom: 8px;
+
+    }
+
+    .auth-form-title {
+
+        font-family: 'Orbitron', sans-serif;
+
+        font-size: 1.8rem;
+
+        font-weight: 700;
+
+        color: #f8fafc;
+
+        margin-bottom: 8px;
+
+    }
+
+    .auth-form-subtitle {
+
+        color: #a9b8cd;
+
+        font-size: 0.94rem;
+
+        line-height: 1.6;
+
+    }
+
+    .auth-hint {
+
+        font-size: 0.72rem;
+
+        letter-spacing: 0.08em;
+
+        text-transform: uppercase;
+
+        color: #8ca2be;
+
+        margin-top: 1rem;
+
+        padding-top: 0.8rem;
+
+        border-top: 1px solid rgba(148, 163, 184, 0.12);
+
+    }
+
+    .auth-bottom-note {
+
+        margin-top: 18px;
+
+        text-align: center;
+
+        font-size: 0.7rem;
+
+        letter-spacing: 0.22em;
+
+        text-transform: uppercase;
+
+        color: #5f6879;
+
+    }
+
+
 
     /* Button overrides */
+
     div.stButton > button:first-child {
+
         background: linear-gradient(135deg, rgba(0, 229, 255, 0.2) 0%, rgba(121, 40, 202, 0.25) 100%);
+
         color: #00e5ff;
+
         border: 1px solid #00e5ff;
-        border-radius: 12px;
-        padding: 10px 18px;
+
+        border-radius: 8px;
+
+        padding: 8px 24px;
+
         font-family: 'Rajdhani', sans-serif;
+
         font-weight: 700;
+
         font-size: 1.05rem;
+
         letter-spacing: 1.5px;
+
         transition: all 0.25s ease;
+
         box-shadow: 0 0 12px rgba(0, 229, 255, 0.15);
+
     }
+
     div.stButton > button:first-child:hover {
+
         background: linear-gradient(135deg, #00e5ff 0%, #7928ca 100%);
+
         color: #ffffff;
+
         border-color: #00e5ff;
-        transform: translateY(-1px);
+
         box-shadow: 0 0 20px rgba(0, 229, 255, 0.45);
+
+        transform: translateY(-1px);
+
     }
+
+
 
     /* Streamlit Input Styling */
+
     div[data-baseweb="input"] {
+
         background-color: rgba(10, 16, 29, 0.8) !important;
-        border-radius: 12px !important;
+
+        border-radius: 8px !important;
+
         border: 1px solid rgba(0, 229, 255, 0.25) !important;
+
         color: #f1f5f9 !important;
-        box-shadow: none !important;
+
     }
+
     div[data-baseweb="input"]:focus-within {
+
         border-color: #00e5ff !important;
+
         box-shadow: 0 0 10px rgba(0, 229, 255, 0.3) !important;
+
     }
-    
+
+
+
     /* Progress bar customization */
+
     .stProgress > div > div > div > div {
+
         background-image: linear-gradient(to right, #00e5ff, #7928ca);
+
     }
-    </style>
-    """, unsafe_allow_html=True)
+
+  </style>
+
+""")
 
 
-# ==============================================================================
-# Authentication State Management
-# ==============================================================================
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
-if "username" not in st.session_state:
-    st.session_state.username = ""
-if "current_page" not in st.session_state:
-    st.session_state.current_page = "Dashboard"
+
+# Background
+
+st.html("""
+
+<div class="morph-container">
+
+    <div class="morph one"></div>
+
+    <div class="morph two"></div>
+
+    <div class="morph three"></div>
+
+</div>
+
+""")
 
 
-def render_login_page():
-    """Renders the presentation-ready, true 2-column horizontal login screen."""
-    inject_custom_css()
 
-    col_hero, col_form = st.columns([1.3, 0.9], gap="large")
 
-    # LEFT COLUMN: Visual Brand Hero
-    with col_hero:
-        st.markdown("""
-        <div class="glass-card" style="height: 100%; display: flex; flex-direction: column; justify-content: center; min-height: 410px; padding-top: 22px; padding-bottom: 22px;">
-            <div style="display: inline-block; padding: 4px 12px; background: rgba(0, 229, 255, 0.1); border: 1px solid #00e5ff; border-radius: 20px; font-size: 0.75rem; letter-spacing: 2px; color: #00e5ff; margin-bottom: 14px; width: fit-content;">
-                AI MEDIA FORENSICS SUITE
+
+# ============================================================
+
+# MODEL
+
+# ============================================================
+
+
+
+@st.cache_resource
+
+def load_model():
+
+    model = models.resnet18(weights=None)
+
+    features = model.fc.in_features
+
+    model.fc = nn.Sequential(
+
+        nn.Dropout(0.4),
+
+        nn.Linear(features, 2),
+
+    )
+
+
+
+    model.load_state_dict(
+
+        torch.load(
+
+            "models/best_resnet18_deepfake.pth",
+
+            map_location=DEVICE,
+
+        )
+
+    )
+
+    model.to(DEVICE)
+
+    model.eval()
+
+    return model
+
+
+
+
+
+model = load_model()
+
+
+
+transform = transforms.Compose([
+
+    transforms.Resize((224, 224)),
+
+    transforms.ToTensor(),
+
+    transforms.Normalize(
+
+        mean=[0.485, 0.456, 0.406],
+
+        std=[0.229, 0.224, 0.225],
+
+    ),
+
+])
+
+
+
+cascade_path = os.path.join(
+
+    ".venv",
+
+    "Lib",
+
+    "site-packages",
+
+    "cv2",
+
+    "data",
+
+    "haarcascade_frontalface_default.xml",
+
+)
+
+
+
+face_detector = cv2.CascadeClassifier(cascade_path)
+
+
+
+
+
+# ============================================================
+
+# HELPERS
+
+# ============================================================
+
+
+
+def show_navbar():
+
+    st.html(f"""
+
+    <div class="navbar">
+
+        <div class="brand">
+
+            <div class="brand-icon">🛡️</div>
+
+            <div>
+
+                <div class="brand-name">DeepGuard</div>
+
+                <div class="brand-sub">AI Media Security</div>
+
             </div>
-            <div class="brand-title" style="font-size: 2.0rem;">ALETHEIA AI</div>
-            <div class="tagline" style="font-size: 1.3rem;">SEE THROUGH<br/>THE FAKE.</div>
-            <p class="subtagline" style="margin-top: 8px; margin-bottom: 0;">
-                Aletheia AI analyzes visual media using state-of-the-art computer vision
-                and deep transfer learning to protect media authenticity and expose synthetic face manipulation.
-            </p>
-            <div style="margin-top: 18px; padding-top: 14px; border-top: 1px solid rgba(255, 255, 255, 0.1);">
-                <div style="display: flex; gap: 18px; color: #64748b; font-size: 0.82rem; letter-spacing: 2px; font-weight: 600;">
-                    <span>• ANALYSE</span>
-                    <span>• DETECT</span>
-                    <span>• PROTECT</span>
-                </div>
-            </div>
+
         </div>
-        """, unsafe_allow_html=True)
 
-    # RIGHT COLUMN: Secure Access Authentication Form
-    
-    # RIGHT COLUMN: Secure Access Authentication Form
-    with col_form:
-        with st.container(key="auth_panel"):
-            st.markdown(
-                """
+        <div style="color:#858696;font-size:10px;">
+
+            USER · {st.session_state.username}
+
+        </div>
+
+    </div>
+
+    """)
+
+
+
+
+
+def prediction_values(fake_probability):
+
+    real_probability = 1.0 - fake_probability
+
+
+
+    if fake_probability >= 0.65:
+
+        return "FAKE", fake_probability, "fake", "⚠️"
+
+    if fake_probability <= 0.35:
+
+        return "REAL", real_probability, "real", "✓"
+
+    return "UNCERTAIN", max(fake_probability, real_probability), "uncertain", "◐"
+
+
+
+
+
+def result_card(prediction, confidence, css_class, icon):
+
+    st.html(f"""
+
+    <div class="result {css_class}">
+
+        <div class="result-icon">{icon}</div>
+
+        <div class="result-label">{prediction}</div>
+
+        <div class="result-confidence">
+
+            Confidence · {confidence * 100:.2f}%
+
+        </div>
+
+    </div>
+
+    """)
+
+
+
+
+
+def page_heading(label, title_first, title_second, description):
+
+    st.html(f"""
+
+<div style="animation:pageIn .45s ease;">
+
+    <div class="eyebrow">{label}</div>
+
+    <div class="page-title">{title_first}<br><span>{title_second}</span></div>
+
+    <div class="page-description">{description}</div>
+
+</div>
+
+    """)
+
+
+
+
+
+# ============================================================
+
+# AUTHENTICATION
+
+# ============================================================
+
+
+
+def show_auth():
+
+    """Desktop login screen: branding on the left, credentials on the right."""
+
+    left, right = st.columns([1.12, 0.88], gap="small")
+
+
+
+    # --------------------------------------------------------
+
+    # LEFT: branding / project introduction
+
+    # --------------------------------------------------------
+
+    with left:
+
+        st.html("""
+
+        <div class="auth-brand-card">
+
+            <div class="auth-glow"></div>
+
+            <div class="auth-label">AI MEDIA SECURITY</div>
+
+
+
+            <div class="auth-brand-center">
+
                 <div class="auth-title">
-                    SECURE ACCESS
+
+                    SEE THROUGH<br>
+
+                    <span>THE FAKE.</span>
+
                 </div>
-                <div class="subtagline"
-                     style="font-size: 0.85rem; margin-bottom: 16px;">
-                    Authenticate to access Aletheia forensic tools
+
+                <div class="auth-description">
+
+                    DeepGuard uses computer vision and deep learning
+
+                    to screen images and videos for potential manipulation.
+
                 </div>
-                """,
-                unsafe_allow_html=True,
-            )
 
-            tab_login, tab_register = st.tabs(
-                ["[ LOGIN ]", "[ REGISTER ]"]
-            )
+            </div>
 
-            with tab_login:
-                with st.form("login_form", clear_on_submit=False):
-                    username_input = st.text_input(
-                        "Username",
-                        key="login_user",
-                        placeholder="Enter your username",
-                    )
-                    password_input = st.text_input(
-                        "Password",
-                        type="password",
-                        key="login_pass",
-                        placeholder="Enter password",
-                    )
-                    submit_login = st.form_submit_button(
-                        "LOGIN →",
-                        use_container_width=True,
-                    )
 
-                    if submit_login:
-                        success, msg = authenticate_user(
-                            username_input, password_input
-                        )
-                        if success:
-                            st.session_state.authenticated = True
-                            st.session_state.username = username_input.strip()
-                            st.session_state.current_page = "Dashboard"
-                            st.rerun()
-                        else:
-                            st.error(msg)
 
-                st.caption(
-                    "Default college viva demo: **admin** / **admin123**"
+            <div class="auth-footer">
+
+                <span>ANALYSE</span>
+
+                <i></i>
+
+                <span>DETECT</span>
+
+                <i></i>
+
+                <span>PROTECT</span>
+
+            </div>
+
+        </div>
+
+        """)
+
+
+
+    # --------------------------------------------------------
+
+    # RIGHT: REAL STREAMLIT LOGIN / REGISTER CONTROLS
+
+    # --------------------------------------------------------
+
+    with right:
+
+        with st.container(border=True):
+
+            st.html("""
+
+            <div class="auth-form-head">
+
+                <div class="auth-form-kicker">SECURE ACCESS</div>
+
+                <div class="auth-form-title">Welcome to DeepGuard</div>
+
+                <div class="auth-form-subtitle">
+
+                    Sign in to access your AI-powered media analysis workspace.
+
+                </div>
+
+            </div>
+
+            """)
+
+
+
+            login_tab, register_tab = st.tabs(["LOGIN", "REGISTER"])
+
+
+
+            with login_tab:
+
+                username = st.text_input(
+
+                    "Username",
+
+                    key="login_username",
+
+                    placeholder="Enter username",
+
                 )
 
-            with tab_register:
-                with st.form("register_form", clear_on_submit=True):
-                    new_username = st.text_input(
-                        "Choose Username",
-                        key="reg_user",
-                        placeholder="Min 3 characters (letters, numbers)",
-                    )
-                    new_password = st.text_input(
-                        "Choose Password",
-                        type="password",
-                        key="reg_pass",
-                        placeholder="Min 6 characters",
-                    )
-                    confirm_password = st.text_input(
-                        "Confirm Password",
-                        type="password",
-                        key="reg_conf",
-                        placeholder="Re-type password",
-                    )
-                    submit_reg = st.form_submit_button(
-                        "CREATE ACCOUNT →",
-                        use_container_width=True,
-                    )
+                password = st.text_input(
 
-                    if submit_reg:
-                        if new_password != confirm_password:
-                            st.error("Passwords do not match.")
+                    "Password",
+
+                    type="password",
+
+                    key="login_password",
+
+                    placeholder="Enter password",
+
+                )
+
+
+
+                if st.button("LOGIN  →", key="login_button"):
+
+                    if authenticate_user(username, password):
+
+                        st.session_state.logged_in = True
+
+                        st.session_state.username = username.strip()
+
+                        st.session_state.page = "Dashboard"
+
+                        st.rerun()
+
+                    else:
+
+                        st.error("Invalid username or password.")
+
+
+
+                st.html("""
+
+                <div class="auth-hint">
+
+                    Enter your registered credentials to continue.
+
+                </div>
+
+                """)
+
+
+
+            with register_tab:
+
+                username = st.text_input(
+
+                    "Username",
+
+                    key="register_username",
+
+                    placeholder="Choose username",
+
+                )
+
+                password = st.text_input(
+
+                    "Password",
+
+                    type="password",
+
+                    key="register_password",
+
+                    placeholder="Create password",
+
+                )
+
+                confirm_password = st.text_input(
+
+                    "Confirm password",
+
+                    type="password",
+
+                    key="register_confirm",
+
+                    placeholder="Repeat password",
+
+                )
+
+
+
+                if st.button("CREATE ACCOUNT  →", key="register_button"):
+
+                    if not username.strip():
+
+                        st.error("Username is required.")
+
+                    elif password != confirm_password:
+
+                        st.error("Passwords do not match.")
+
+                    else:
+
+                        success, message = register_user(username, password)
+
+                        if success:
+
+                            st.success(message)
+
                         else:
-                            reg_success, reg_msg = register_user(
-                                new_username, new_password
-                            )
-                            if reg_success:
-                                st.success(
-                                    f"{reg_msg} You can now log in."
-                                )
-                            else:
-                                st.error(reg_msg)
+
+                            st.error(message)
 
 
-        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.html("""
+
+    <div class="auth-bottom-note">
+
+        DEEPGUARD · AI MEDIA SECURITY · LOCAL AUTHENTICATION
+
+    </div>
+
+    """)
 
 
-# ==============================================================================
-# Main Authenticated Application Dashboard
-# ==============================================================================
-def render_navbar():
-    """Renders the top navigation bar."""
-    st.markdown(f"""
-    <div class="navbar">
-        <div style="display: flex; align-items: center; gap: 12px;">
-            <span style="font-size: 1.6rem;">🛡️</span>
-            <div>
-                <span style="font-family: 'Orbitron', sans-serif; font-size: 1.2rem; font-weight: 800; color: #00e5ff; letter-spacing: 1px;">ALETHEIA AI</span>
-                <span style="font-size: 0.75rem; color: #64748b; margin-left: 10px; border-left: 1px solid #334155; padding-left: 10px;">OPERATOR: <b style="color: #94a3b8;">{st.session_state.username.upper()}</b></span>
+
+
+
+# ============================================================
+
+# DASHBOARD
+
+# ============================================================
+
+
+
+def show_dashboard():
+
+    show_navbar()
+
+
+
+    left, right = st.columns([1.35, .65])
+
+
+
+    with left:
+
+        st.html(f"""
+
+        <div class="dark-card" style="height:270px;padding:30px;">
+
+            <div class="eyebrow">
+
+                WELCOME BACK, {st.session_state.username.upper()}
+
             </div>
+
+            <div class="page-title" style="font-size:48px;">
+
+                Detect what<br><span>isn't real.</span>
+
+            </div>
+
+            <div class="page-description" style="max-width:620px;">
+
+                Analyse digital images and videos for potential deepfake
+
+                manipulation using a ResNet18 deep learning model.
+
+            </div>
+
         </div>
-    </div>
-    """, unsafe_allow_html=True)
 
-    nav_cols = st.columns(7)
-    with nav_cols[0]:
-        if st.button("🏠 Dashboard", use_container_width=True):
-            st.session_state.current_page = "Dashboard"
-            st.rerun()
-    with nav_cols[1]:
-        if st.button("🖼️ Image Detection", use_container_width=True):
-            st.session_state.current_page = "Image Detection"
-            st.rerun()
-    with nav_cols[2]:
-        if st.button("🎥 Video Detection", use_container_width=True):
-            st.session_state.current_page = "Video Detection"
-            st.rerun()
-    with nav_cols[3]:
-        if st.button("📊 Evaluation", use_container_width=True):
-            st.session_state.current_page = "Model Evaluation"
-            st.rerun()
-    with nav_cols[4]:
-        if st.button("ℹ️ About System", use_container_width=True):
-            st.session_state.current_page = "About"
-            st.rerun()
-    
-
-    with nav_cols[5]:
-        if st.button("📜 History", use_container_width=True):
-            st.session_state.current_page = "History"
-            st.rerun()
-
-    with nav_cols[6]:
-        if st.button("🚪 Logout", use_container_width=True):
-            st.session_state.authenticated = False
-            st.session_state.username = ""
-            st.rerun()
+        """)
 
 
 
-# ==============================================================================
-# Dashboard Page
-# ==============================================================================
-def render_dashboard(model_loaded: bool, device: torch.device):
-    st.markdown("""
-    <div class="glass-card" style="margin-bottom: 24px; text-align: center; padding: 32px 20px;">
-        <div style="font-family: 'Orbitron', sans-serif; font-size: 1.8rem; font-weight: 800; color: #f8fafc; letter-spacing: 2px;">
-            AI-POWERED MEDIA AUTHENTICITY ANALYSIS
+    with right:
+
+        st.html("""
+
+        <div class="dark-card" style="height:270px;">
+
+            <div class="card-icon">🛡️</div>
+
+            <div class="card-title">DeepGuard System</div>
+
+            <div class="card-description">
+
+                Image analysis, face detection and video-frame aggregation
+
+                in one compact workspace.
+
+                <br><br>
+
+                <b style="color:#a9a7ff;">Status</b><br>
+
+                Model loaded · Ready
+
+            </div>
+
         </div>
-        <p style="color: #94a3b8; font-size: 1.05rem; margin-top: 8px;">
-            Protecting digital ecosystems by analyzing facial manipulation cues through transfer learning CNNs.
-        </p>
-    </div>
-    """, unsafe_allow_html=True)
 
-    c1, c2, c3 = st.columns([1.3, 1.3, 1.0], gap="medium")
+        """)
+
+
+
+    a, b = st.columns(2)
+
+
+
+    with a:
+
+        st.html("""
+
+        <div class="dark-card" style="height:165px;">
+
+            <div class="card-icon">◈</div>
+
+            <div class="card-title">Image Analysis</div>
+
+            <div class="card-description">
+
+                Upload a facial image and analyse it for potential
+
+                manipulation.
+
+            </div>
+
+        </div>
+
+        """)
+
+        if st.button("OPEN IMAGE ANALYSIS →", key="open_image"):
+
+            st.session_state.page = "Image Detection"
+
+            st.rerun()
+
+
+
+    with b:
+
+        st.html("""
+
+        <div class="dark-card" style="height:165px;">
+
+            <div class="card-icon">◉</div>
+
+            <div class="card-title">Video Analysis</div>
+
+            <div class="card-description">
+
+                Sample multiple frames, detect faces and aggregate
+
+                predictions into a video-level result.
+
+            </div>
+
+        </div>
+
+        """)
+
+        if st.button("OPEN VIDEO ANALYSIS →", key="open_video"):
+
+            st.session_state.page = "Video Detection"
+
+            st.rerun()
+
+
+
+    st.html("""
+
+    <div style="
+
+        margin-top:5px;
+
+        padding:9px 14px;
+
+        border-radius:12px;
+
+        border:1px solid rgba(255,255,255,.05);
+
+        background:rgba(12,13,21,.50);
+
+        color:#6f7180;
+
+        font-size:9px;
+
+    ">
+
+        <b style="color:#9c9dab;">SYSTEM NOTE</b>
+
+        &nbsp; DeepGuard is an academic AI screening system.
+
+        Detection results should not be considered definitive forensic evidence.
+
+    </div>
+
+    """)
+
+
+
+
+
+# ============================================================
+
+# IMAGE DETECTION
+
+# ============================================================
+
+
+
+def show_image_detection():
+
+    show_navbar()
+
+
+
+    uploaded_file = st.file_uploader(
+
+        "Upload image",
+
+        type=["jpg", "jpeg", "png"],
+
+        key="image_uploader",
+
+    )
+
+
+
+    if uploaded_file is None:
+
+        page_heading(
+
+            "IMAGE ANALYSIS",
+
+            "Analyse an",
+
+            "image.",
+
+            "Upload a facial image and let DeepGuard analyse its visual features.",
+
+        )
+
+
+
+        st.html("""
+
+        <div class="dark-card" style="
+
+            height:220px;
+
+            margin-top:12px;
+
+            display:flex;
+
+            align-items:center;
+
+            justify-content:center;
+
+            text-align:center;
+
+        ">
+
+            <div>
+
+                <div style="font-size:42px;">◈</div>
+
+                <div class="card-title">Drop your image here</div>
+
+                <div class="card-description">JPG · JPEG · PNG</div>
+
+            </div>
+
+        </div>
+
+        """)
+
+        return
+
+
+
+    image = Image.open(uploaded_file).convert("RGB")
+
+
+
+    with torch.no_grad():
+
+        input_tensor = transform(image).unsqueeze(0).to(DEVICE)
+
+        output = model(input_tensor)
+
+        probabilities = torch.softmax(output, dim=1)
+
+
+
+    fake_probability = probabilities[0][0].item()
+
+    real_probability = probabilities[0][1].item()
+
+
+
+    prediction, confidence, css_class, icon = prediction_values(
+
+        fake_probability
+
+    )
+
+
+
+    # Everything is horizontal on desktop.
+
+    c1, c2, c3 = st.columns([1.0, 1.0, 1.0])
+
+
 
     with c1:
-        st.markdown("""
-        <div class="glass-card" style="min-height: 260px;">
-            <div style="font-size: 1.8rem; margin-bottom: 8px;">🖼️</div>
-            <div style="font-family: 'Orbitron', sans-serif; font-size: 1.2rem; font-weight: 700; color: #00e5ff;">
-                IMAGE DETECTION
-            </div>
-            <p style="color: #94a3b8; font-size: 0.9rem; margin-top: 10px; min-height: 60px;">
-                Upload standalone portraits (JPG, PNG, WEBP). Analyzes facial region, classifies authenticity, and provides confidence probabilities.
-            </p>
-        </div>
-        """, unsafe_allow_html=True)
-        if st.button("LAUNCH IMAGE DETECTOR →", key="dash_img_btn", use_container_width=True):
-            st.session_state.current_page = "Image Detection"
-            st.rerun()
+
+        st.markdown("**INPUT IMAGE**")
+
+        st.image(
+
+            image,
+
+            caption="Uploaded image",
+
+            width=300,
+
+        )
+
+
 
     with c2:
-        st.markdown("""
-        <div class="glass-card" style="min-height: 260px;">
-            <div style="font-size: 1.8rem; margin-bottom: 8px;">🎥</div>
-            <div style="font-family: 'Orbitron', sans-serif; font-size: 1.2rem; font-weight: 700; color: #7928ca;">
-                VIDEO DETECTION
-            </div>
-            <p style="color: #94a3b8; font-size: 0.9rem; margin-top: 10px; min-height: 60px;">
-                Analyze videos (MP4, AVI, MOV). Uniformly samples frames, crops faces, and aggregates probabilities across temporal frames.
-            </p>
-        </div>
-        """, unsafe_allow_html=True)
-        if st.button("LAUNCH VIDEO DETECTOR →", key="dash_vid_btn", use_container_width=True):
-            st.session_state.current_page = "Video Detection"
-            st.rerun()
+
+        st.markdown("**DETECTION RESULT**")
+
+        result_card(
+
+            prediction,
+
+            confidence,
+
+            css_class,
+
+            icon,
+
+        )
+
+
+
+        st.metric(
+
+            "MODEL CONFIDENCE",
+
+            f"{confidence * 100:.2f}%",
+
+        )
+
+
 
     with c3:
-        status_text = "ONLINE" if model_loaded else "OFFLINE"
-        status_color = "#00ff88" if model_loaded else "#ff3366"
-        st.markdown(f"""
-        <div class="glass-card" style="min-height: 260px;">
-            <div style="font-family: 'Orbitron', sans-serif; font-size: 1.05rem; font-weight: 700; color: #f8fafc; margin-bottom: 16px;">
-                SYSTEM TELEMETRY
-            </div>
-            <div class="metric-box">
-                <div class="metric-value">ResNet18</div>
-                <div class="metric-label">NEURAL BACKBONE</div>
-            </div>
-            <div class="metric-box">
-                <div class="metric-value" style="color: #7928ca;">{str(device).upper()}</div>
-                <div class="metric-label">INFERENCE DEVICE</div>
-            </div>
-            <div class="metric-box">
-                <div class="metric-value" style="color: {status_color};">{status_text}</div>
-                <div class="metric-label">MODEL STATUS</div>
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
+
+        st.markdown("**ANALYSIS**")
 
 
-# ==============================================================================
-# Image Detection Page
-# ==============================================================================
-def render_image_detection(model, cascade, transform, device, model_loaded: bool):
-    st.markdown("""
-    <div style="margin-bottom: 18px;">
-        <div style="font-family: 'Orbitron', sans-serif; font-size: 1.4rem; font-weight: 700; color: #00e5ff;">
-            IMAGE AUTHENTICITY ANALYSIS
-        </div>
-        <div style="color: #94a3b8; font-size: 0.9rem;">
-            Upload a portrait image or select a sample image for deep learning facial forensic inspection.
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
 
-    if not model_loaded:
-        st.warning("The detection model is unavailable. See the model error above.")
+        st.metric(
+
+            "FAKE PROBABILITY",
+
+            f"{fake_probability * 100:.2f}%",
+
+        )
+
+        st.progress(fake_probability)
+
+
+
+        st.metric(
+
+            "REAL PROBABILITY",
+
+            f"{real_probability * 100:.2f}%",
+
+        )
+
+        st.progress(real_probability)
+
+
+
+    st.warning(
+
+        "AI screening result only — not definitive proof of manipulation."
+
+    )
+
+
+
+
+
+# ============================================================
+
+# VIDEO DETECTION
+
+# ============================================================
+
+
+
+def show_video_detection():
+
+    show_navbar()
+
+
+
+    uploaded_video = st.file_uploader(
+
+        "Upload video",
+
+        type=["mp4", "avi", "mov"],
+
+        key="video_uploader",
+
+    )
+
+
+
+    if uploaded_video is None:
+
+        page_heading(
+
+            "VIDEO ANALYSIS",
+
+            "Analyse a",
+
+            "video.",
+
+            "Sample multiple frames, detect faces and produce a video-level prediction.",
+
+        )
+
+
+
+        st.html("""
+
+        <div class="dark-card" style="
+
+            height:220px;
+
+            margin-top:12px;
+
+            display:flex;
+
+            align-items:center;
+
+            justify-content:center;
+
+            text-align:center;
+
+        ">
+
+            <div>
+
+                <div style="font-size:42px;">◉</div>
+
+                <div class="card-title">Upload your video</div>
+
+                <div class="card-description">MP4 · AVI · MOV</div>
+
+            </div>
+
+        </div>
+
+        """)
+
         return
 
-    # Compact 3-column layout
-    col_upload, col_preview, col_results = st.columns([1.1, 1.2, 1.3], gap="medium")
 
-    uploaded_file = None
-    with col_upload:
-        st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-        st.markdown("##### 1. Media Input")
-        uploaded_file = st.file_uploader(
-            "Upload image",
-            type=["jpg", "jpeg", "png", "webp"],
-            help="Supported: JPG, JPEG, PNG, WEBP"
+
+    left, right = st.columns([1.0, 1.25])
+
+
+
+    with left:
+
+        st.markdown("**VIDEO PREVIEW**")
+
+        st.video(uploaded_video, start_time=0)
+
+
+
+        analyze = st.button(
+
+            "START VIDEO ANALYSIS →",
+
+            key="start_video_analysis",
+
         )
 
-        # Quick preset selector for immediate viva demo
-        st.markdown("<hr style='border-color: rgba(255,255,255,0.08); margin: 12px 0;'>", unsafe_allow_html=True)
-        st.caption("Or test with preloaded demonstration samples:")
-        sample_choice = st.selectbox(
-            "Select sample:",
-            ["(None)", "Real Portrait Sample", "Fake Manipulated Sample", "Scene with No Face"]
-        )
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    # Resolve image source
-    image_to_process = None
-    if uploaded_file is not None:
-        try:
-            image_to_process = Image.open(uploaded_file).convert("RGB")
-        except Exception as e:
-            st.error(f"Failed to read uploaded image: {e}")
-    elif sample_choice != "(None)":
-        sample_map = {
-            "Real Portrait Sample": os.path.join(SAMPLE_IMAGES_DIR, "real_face_01.jpg"),
-            "Fake Manipulated Sample": os.path.join(SAMPLE_IMAGES_DIR, "fake_face_01.jpg"),
-            "Scene with No Face": os.path.join(SAMPLE_IMAGES_DIR, "no_face_01.jpg"),
-        }
-        target_path = sample_map[sample_choice]
-        if os.path.exists(target_path):
-            image_to_process = Image.open(target_path).convert("RGB")
-
-    with col_preview:
-        st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-        st.markdown("##### 2. Inspection Preview")
-        if image_to_process is not None:
-            # Display compact image (max width ~320px)
-            st.image(image_to_process, caption="Input Media", use_container_width=True)
-        else:
-            st.info("Upload an image on the left or select a sample to preview.")
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    with col_results:
-        st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-        st.markdown("##### 3. AI Forensic Verdict")
-        analyze_clicked = st.button("🔍 ANALYZE IMAGE", use_container_width=True)
-
-        if image_to_process is not None and analyze_clicked:
-            # Convert to OpenCV BGR
-            np_img = np.array(image_to_process)
-            cv_img = cv2.cvtColor(np_img, cv2.COLOR_RGB2BGR)
-
-            # Detect face
-            gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
-            equalized_gray = cv2.equalizeHist(gray)
-            face_candidates = []
-            for detection_image, scale_factor, min_neighbors, min_size in (
-                (gray, 1.1, 5, (30, 30)),
-                (equalized_gray, 1.03, 3, (15, 15)),
-            ):
-                detected = cascade.detectMultiScale(
-                    detection_image,
-                    scaleFactor=scale_factor,
-                    minNeighbors=min_neighbors,
-                    minSize=min_size,
-                )
-                face_candidates.extend(detected)
-
-            # Keep the strongest-sized box when detector passes overlap on one face.
-            face_candidates.sort(key=lambda rect: rect[2] * rect[3], reverse=True)
-            faces = []
-            for candidate in face_candidates:
-                x, y, w, h = candidate
-                duplicate = False
-                for kept_x, kept_y, kept_w, kept_h in faces:
-                    intersection_w = max(0, min(x + w, kept_x + kept_w) - max(x, kept_x))
-                    intersection_h = max(0, min(y + h, kept_y + kept_h) - max(y, kept_y))
-                    intersection = intersection_w * intersection_h
-                    smaller_area = min(w * h, kept_w * kept_h)
-                    if smaller_area and intersection / smaller_area > 0.8:
-                        duplicate = True
-                        break
-                if not duplicate:
-                    faces.append(candidate)
-
-            if len(faces) == 0:
-                st.error("❌ **No detectable face found.**\nPlease upload an image containing a clear, visible human face.")
-            else:
-                ih, iw = cv_img.shape[:2]
-                face_tensors = []
-                for x, y, w, h in faces:
-                    mx, my = int(w * 0.15), int(h * 0.15)
-                    x1, y1 = max(0, x - mx), max(0, y - my)
-                    x2, y2 = min(iw, x + w + mx), min(ih, y + h + my)
-                    face_crop = cv_img[y1:y2, x1:x2]
-                    if face_crop.size == 0:
-                        continue
-
-                    face_rgb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
-                    face_tensors.append(transform(Image.fromarray(face_rgb)))
-
-                if not face_tensors:
-                    st.error("❌ **No usable face crops found.** Please upload a clearer image.")
-                    st.stop()
-
-                batch = torch.stack(face_tensors).to(device)
-
-                with torch.no_grad():
-                    start_t = time.time()
-                    logits = model(batch)
-                    latency = (time.time() - start_t) * 1000.0
-                    face_probs = torch.softmax(logits, dim=1).cpu().numpy()
-
-                # Class 0 = FAKE, class 1 = REAL; each face gets one vote.
-                face_votes = np.argmax(face_probs, axis=1)
-                fake_votes = int(np.count_nonzero(face_votes == 0))
-                real_votes = int(np.count_nonzero(face_votes == 1))
-                face_count = len(face_votes)
-                fake_prob = float(face_probs[:, 0].mean())
-                real_prob = float(face_probs[:, 1].mean())
-
-                if real_votes > fake_votes:
-                    pred_class = "REAL"
-                    badge_html = '<div class="badge-real">AUTHENTIC / REAL</div>'
-                    confidence = real_votes / face_count
-                elif fake_votes > real_votes:
-                    pred_class = "FAKE"
-                    badge_html = '<div class="badge-fake">MANIPULATED / FAKE</div>'
-                    confidence = fake_votes / face_count
-                else:
-                    pred_class = "UNCERTAIN"
-                    badge_html = '<div class="badge-uncertain">UNCERTAIN</div>'
-                    confidence = max(fake_votes, real_votes) / face_count
-                
-                save_detection(
-                    username=st.session_state.username,
-                    file_name=(
-                        uploaded_file.name
-                        if uploaded_file is not None
-                        else sample_choice
-                    ),
-                    media_type="image",
-                    prediction=pred_class,
-                    confidence=confidence
-                )
 
 
-                st.markdown(f"<div style='text-align: center; margin: 16px 0;'>{badge_html}</div>", unsafe_allow_html=True)
-                
-                if pred_class == "UNCERTAIN":
-                    st.caption("⚠️ The model does not possess sufficient statistical confidence to confirm authenticity.")
+    if not analyze:
 
-                # Probability bars
-                st.markdown(f"**Confidence:** `{confidence * 100:.1f}%`")
-                st.caption(f"Faces analyzed: {face_count} | Real votes: {real_votes} | Fake votes: {fake_votes}")
-                st.markdown(f"Fake Probability (`{fake_prob * 100:.1f}%`):")
-                st.progress(float(fake_prob))
+        with right:
 
-                st.markdown(f"Real Probability (`{real_prob * 100:.1f}%`):")
-                st.progress(float(real_prob))
+            st.html("""
 
-                st.markdown(f"""
-                <div style="display: flex; justify-content: space-between; font-size: 0.8rem; color: #64748b; margin-top: 14px; border-top: 1px solid rgba(255,255,255,0.06); padding-top: 8px;">
-                    <span>Faces Analyzed: {face_count}</span>
-                    <span>Inference: {latency:.1f} ms</span>
-                    <span>Device: {str(device).upper()}</span>
+            <div class="dark-card" style="height:300px;">
+
+                <div class="card-icon">◎</div>
+
+                <div class="card-title">Ready for analysis</div>
+
+                <div class="card-description">
+
+                    Up to 20 evenly distributed frames will be sampled.
+
+                    Faces are detected and the largest detected face from
+
+                    each usable frame is passed to the ResNet18 model.
+
                 </div>
-                """, unsafe_allow_html=True)
-        elif image_to_process is not None:
-            st.info("Image ready. Select Analyze Image to run the forensic inspection.")
-        else:
-            st.info("Awaiting image input...")
 
-        st.markdown('</div>', unsafe_allow_html=True)
+            </div>
 
+            """)
 
-# ==============================================================================
-# Video Detection Page
-# ==============================================================================
-def render_video_detection(model, cascade, transform, device, model_loaded: bool):
-    st.markdown("""
-    <div style="margin-bottom: 18px;">
-        <div style="font-family: 'Orbitron', sans-serif; font-size: 1.4rem; font-weight: 700; color: #00e5ff;">
-            VIDEO-LEVEL MEDIA FORENSICS
-        </div>
-        <div style="color: #94a3b8; font-size: 0.9rem;">
-            Analyzes multiple frames across video timeline, extracts faces, and aggregates probabilities.
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    if not model_loaded:
-        st.warning("The detection model is unavailable. See the model error above.")
         return
 
-    col_input, col_analysis = st.columns([1.1, 1.4], gap="medium")
-
-    video_source_path = None
-    with col_input:
-        st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-        st.markdown("##### 1. Video Source")
-        uploaded_video = st.file_uploader(
-            "Upload video file",
-            type=["mp4", "avi", "mov", "mkv"],
-            help="Supports standard formats like MP4, AVI, MOV"
-        )
-
-        st.markdown("<hr style='border-color: rgba(255,255,255,0.08); margin: 12px 0;'>", unsafe_allow_html=True)
-        st.caption("Or test with demonstration videos:")
-        sample_v_choice = st.selectbox(
-            "Select sample video:",
-            ["(None)", "Real Video Sample 01", "Fake DeepFake Sample 01"]
-        )
-
-        if uploaded_video is not None:
-            # Save to temporary file for OpenCV access
-            tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-            tfile.write(uploaded_video.read())
-            video_source_path = tfile.name
-        elif sample_v_choice != "(None)":
-            sample_v_map = {
-                "Real Video Sample 01": os.path.join(SAMPLE_VIDEOS_DIR, "real", "real_video_01.mp4"),
-                "Fake DeepFake Sample 01": os.path.join(SAMPLE_VIDEOS_DIR, "fake", "fake_video_01.mp4"),
-            }
-            video_source_path = ensure_ascii_safe_copy(sample_v_map[sample_v_choice])
-
-        # Compact video preview
-        if video_source_path and os.path.exists(video_source_path):
-            st.markdown("<div style='max-width: 360px;'>", unsafe_allow_html=True)
-            st.video(video_source_path)
-            st.markdown("</div>", unsafe_allow_html=True)
-            
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    with col_analysis:
-        st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-        st.markdown("##### 2. Analysis Configuration & Results")
-
-        cfg_col1, cfg_col2 = st.columns(2)
-        with cfg_col1:
-            sample_frames_count = st.slider("Frames to sample", min_value=5, max_value=40, value=20, step=5)
-        with cfg_col2:
-            agg_method = st.selectbox("Aggregation Strategy", ["mean", "median", "majority"])
-
-        analyze_clicked = st.button("🔍 ANALYZE VIDEO", use_container_width=True)
-
-        if analyze_clicked and video_source_path:
-            with st.spinner("Processing video frames and extracting facial features..."):
-                prog_bar = st.progress(0)
-                for pct in range(20, 90, 20):
-                    time.sleep(0.05)
-                    prog_bar.progress(pct)
-
-                results = predict_video(
-                    video_path=video_source_path,
-                    model=model,
-                    classifier=cascade,
-                    transform=transform,
-                    device=device,
-                    sample_frames=sample_frames_count,
-                    aggregation=agg_method
-                )
-                prog_bar.progress(100)
-
-            if results["prediction"] == "NO_FACE":
-                st.error("❌ " + results["message"])
-            else:
-                pred = results["prediction"]
-                conf = results["confidence"]
-                p_fake = results["fake_probability"]
-                p_real = results["real_probability"]
-                
-                save_detection(
-                    username=st.session_state.username,
-                    file_name=(
-                        uploaded_video.name
-                        if uploaded_video is not None
-                        else os.path.basename(video_source_path)
-                    ),
-                    media_type="video",
-                    prediction=pred,
-                    confidence=conf
-                )
 
 
-                if pred == "FAKE":
-                    badge_html = '<div class="badge-fake">VIDEO VERDICT: FAKE</div>'
-                elif pred == "REAL":
-                    badge_html = '<div class="badge-real">VIDEO VERDICT: REAL</div>'
-                else:
-                    badge_html = '<div class="badge-uncertain">VIDEO VERDICT: UNCERTAIN</div>'
+    # Save upload temporarily.
 
-                st.markdown(f"<div style='text-align: center; margin: 18px 0;'>{badge_html}</div>", unsafe_allow_html=True)
+    suffix = os.path.splitext(uploaded_video.name)[1]
 
-                # Metric highlights
-                m1, m2, m3, m4 = st.columns(4)
-                with m1:
-                    st.markdown(f"<div class='metric-box'><div class='metric-value'>{results['frames_analyzed']}</div><div class='metric-label'>FRAMES</div></div>", unsafe_allow_html=True)
-                with m2:
-                    st.markdown(f"<div class='metric-box'><div class='metric-value'>{results['faces_detected']}</div><div class='metric-label'>FACES</div></div>", unsafe_allow_html=True)
-                with m3:
-                    st.markdown(f"<div class='metric-box'><div class='metric-value'>{conf*100:.1f}%</div><div class='metric-label'>CONFIDENCE</div></div>", unsafe_allow_html=True)
-                with m4:
-                    st.markdown(f"<div class='metric-box'><div class='metric-value'>{p_fake*100:.1f}%</div><div class='metric-label'>AVG FAKE PROB</div></div>", unsafe_allow_html=True)
-
-                # Multi-frame timeline
-                if len(results["frame_probabilities"]) > 1:
-                    st.markdown("###### Temporal Frame-by-Frame Fake Probability")
-                    chart_df = pd.DataFrame({
-                        "Frame": [f"F#{i+1}" for i in range(len(results["frame_probabilities"]))],
-                        "Fake Probability": results["frame_probabilities"]
-                    }).set_index("Frame")
-                    st.line_chart(chart_df, height=180)
-
-        elif not video_source_path:
-            st.info("Please select or upload a video file to begin analysis.")
-
-        st.markdown('</div>', unsafe_allow_html=True)
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
 
 
-# ==============================================================================
-# Model Evaluation Page
-# ==============================================================================
-def render_evaluation_page():
-    st.markdown("""
-    <div style="margin-bottom: 18px;">
-        <div style="font-family: 'Orbitron', sans-serif; font-size: 1.4rem; font-weight: 700; color: #00e5ff;">
-            EMPIRICAL MODEL EVALUATION & METRICS
-        </div>
-        <div style="color: #94a3b8; font-size: 0.9rem;">
-            Academic evaluation results computed directly from the test dataset partition.
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    col_cm, col_loss = st.columns(2, gap="medium")
-
-    cm_path = os.path.join(RESULTS_DIR, "confusion_matrix.png")
-    hist_path = os.path.join(RESULTS_DIR, "training_history.png")
-    metrics_path = os.path.join(RESULTS_DIR, "metrics.txt")
-
-    with col_cm:
-        st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-        st.markdown("##### Confusion Matrix (Test Split)")
-        if os.path.exists(cm_path):
-            st.image(cm_path, caption="Confusion Matrix [0=FAKE, 1=REAL]", use_container_width=True)
-        else:
-            st.info("Confusion matrix plot not found. Run `python evaluate.py` to generate.")
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    with col_loss:
-        st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-        st.markdown("##### Training History Curves")
-        if os.path.exists(hist_path):
-            st.image(hist_path, caption="Loss & Accuracy across Epochs", use_container_width=True)
-        else:
-            st.info("Training history plot not found. Run `python train_transfer.py` to generate.")
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    st.markdown('<div class="glass-card" style="margin-top: 18px;">', unsafe_allow_html=True)
-    st.markdown("##### Academic Metrics Report")
-    if os.path.exists(metrics_path):
-        with open(metrics_path, "r") as f:
-            st.code(f.read(), language="text")
-    else:
-        st.info("Metrics report file not found. Run `python evaluate.py` to generate.")
-    st.markdown('</div>', unsafe_allow_html=True)
-
-
-# ==============================================================================
-# About Page
-# ==============================================================================
-def render_about_page():
-    st.markdown("""
-    <div class="glass-card" style="margin-bottom: 20px;">
-        <div class="brand-title">PROJECT SPECIFICATIONS</div>
-        <div style="color: #94a3b8; font-size: 0.95rem; line-height: 1.7;">
-            <b>Project Title:</b> Deepfake Detection: Protecting Images and Videos Using Deepfake Detection (Aletheia AI)<br/>
-            <b>Academic Purpose:</b> Final-Year Computer Science Engineering Capstone Project<br/>
-            <b>Core Architecture:</b> ResNet18 Transfer Learning with Custom Dropout & Binary Classification Head<br/>
-            <b>Benchmark Dataset:</b> FaceForensics++ (DeepFakes Manipulation Category)
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-    c1, c2 = st.columns(2, gap="medium")
-
-    with c1:
-        st.markdown("""
-        <div class="glass-card" style="min-height: 280px;">
-            <div style="font-family: 'Orbitron', sans-serif; font-size: 1.15rem; font-weight: 700; color: #00e5ff; margin-bottom: 12px;">
-                FORENSIC PIPELINE ARCHITECTURE
-            </div>
-            <div style="font-family: 'Rajdhani', sans-serif; font-size: 1.05rem; line-height: 1.8; color: #cbd5e1;">
-                1. <b>Video Input:</b> Read video frames via OpenCV.<br/>
-                2. <b>Temporal Sampling:</b> Extract uniformly spaced frames.<br/>
-                3. <b>Face Localization:</b> Detect facial bounding box via Haar Cascade.<br/>
-                4. <b>Margin Cropping & Preprocessing:</b> Crop face + 15% margin, resize to 224×224, apply ImageNet normalization.<br/>
-                5. <b>ResNet18 Inference:</b> Extract deep representations, apply dropout (p=0.5), compute softmax probabilities.<br/>
-                6. <b>Temporal Aggregation:</b> Aggregate probabilities across frames.<br/>
-                7. <b>Uncertainty Gating:</b> Classify as REAL, FAKE, or UNCERTAIN.
-            </div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    with c2:
-        st.markdown("""
-        <div class="glass-card" style="min-height: 280px;">
-            <div style="font-family: 'Orbitron', sans-serif; font-size: 1.15rem; font-weight: 700; color: #ffb800; margin-bottom: 12px;">
-                ACADEMIC HONESTY & LIMITATIONS DISCLOSURE
-            </div>
-            <p style="color: #cbd5e1; font-size: 0.92rem; line-height: 1.7;">
-                Deepfake detection is inherently <b>probabilistic</b>. Real-world performance depends heavily on:
-            </p>
-            <ul style="color: #94a3b8; font-size: 0.9rem; line-height: 1.6;">
-                <li>Training dataset distribution and variety of faces</li>
-                <li>Video compression artifacts (e.g. H.264/H.265 compression loss)</li>
-                <li>Novel GAN / Diffusion manipulation techniques not seen during training</li>
-                <li>Extreme illumination angles, heavy motion blur, or partial facial occlusion</li>
-            </ul>
-            <p style="color: #64748b; font-size: 0.82rem; margin-top: 10px;">
-                <i>Note: This system does not claim 100% universal accuracy on arbitrary wild media. The UNCERTAIN classification prevents false confidence on ambiguous samples.</i>
-            </p>
-        </div>
-        """, unsafe_allow_html=True)
-
-# ==============================================================================
-# Detection History Page
-# ==============================================================================
-
-def render_detection_history():
-    st.markdown(
-        "## 📜 Detection History"
-    )
-    st.caption(
-        "View your previously completed image and video analyses."
-    )
-
-    if st.button("🔄 Refresh History"):
-        st.rerun()
 
     try:
-        db = get_supabase()
 
-        response = (
-            db.table("detection_history")
-            .select(
-                "created_at, file_name, media_type, "
-                "prediction, confidence"
-            )
-            .eq("username", st.session_state.username)
-            .order("created_at", desc=True)
-            .limit(100)
-            .execute()
+        temp_file.write(uploaded_video.getvalue())
+
+        temp_file.close()
+
+
+
+        video_path = temp_file.name
+
+        cap = cv2.VideoCapture(video_path)
+
+
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+
+        duration = total_frames / fps if fps > 0 else 0
+
+
+
+        sample_count = min(20, total_frames)
+
+
+
+        if sample_count <= 0:
+
+            st.error("Could not read this video.")
+
+            cap.release()
+
+            return
+
+
+
+        frame_indices = np.linspace(
+
+            0,
+
+            max(total_frames - 1, 0),
+
+            sample_count,
+
+            dtype=int,
+
         )
 
-        records = response.data
 
-        if records:
-            st.success(
-                f"Found {len(records)} detection records."
+
+        fake_probabilities = []
+
+        detected_faces = 0
+
+        progress = st.progress(0, text="Analysing frames...")
+
+
+
+        for i, frame_index in enumerate(frame_indices):
+
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_index))
+
+            success, frame = cap.read()
+
+
+
+            if not success:
+
+                progress.progress(
+
+                    int((i + 1) / len(frame_indices) * 100),
+
+                    text="Analysing frames...",
+
+                )
+
+                continue
+
+
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+
+
+            faces = face_detector.detectMultiScale(
+
+                gray,
+
+                scaleFactor=1.1,
+
+                minNeighbors=5,
+
+                minSize=(60, 60),
+
             )
 
-            st.dataframe(
-                records,
-                use_container_width=True,
-                hide_index=True
+
+
+            if len(faces) == 0:
+
+                progress.progress(
+
+                    int((i + 1) / len(frame_indices) * 100),
+
+                    text="Analysing frames...",
+
+                )
+
+                continue
+
+
+
+            detected_faces += 1
+
+
+
+            largest_face = max(
+
+                faces,
+
+                key=lambda rect: rect[2] * rect[3],
+
             )
-        else:
-            st.info(
-                "No detection history yet. "
-                "Analyze an image or video first."
+
+
+
+            x, y, w, h = largest_face
+
+            face = frame[y:y + h, x:x + w]
+
+
+
+            face = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
+
+            face_image = Image.fromarray(face)
+
+
+
+            input_tensor = transform(face_image).unsqueeze(0).to(DEVICE)
+
+
+
+            with torch.no_grad():
+
+                output = model(input_tensor)
+
+                probabilities = torch.softmax(output, dim=1)
+
+
+
+            fake_probability = probabilities[0][0].item()
+
+            fake_probabilities.append(fake_probability)
+
+
+
+            progress.progress(
+
+                int((i + 1) / len(frame_indices) * 100),
+
+                text="Analysing frames...",
+
             )
 
-    except Exception as e:
-        st.error(
-            f"Could not load detection history: {e}"
-        )
 
 
-# ==============================================================================
-# Application Router
-# ==============================================================================
-def main():
-    if not st.session_state.authenticated:
-        render_login_page()
+        cap.release()
+
+
+
+    finally:
+
+        try:
+
+            os.remove(temp_file.name)
+
+        except OSError:
+
+            pass
+
+
+
+    if len(fake_probabilities) == 0:
+
+        st.error("No detectable faces were found in the sampled frames.")
+
+        return
+
+
+
+    # Robust video-level aggregation
+    median_fake_probability = float(np.median(fake_probabilities))
+    fake_frame_ratio = float(
+        np.mean(np.array(fake_probabilities) >= 0.65)
+    )
+
+    # Require strong probability and agreement across frames
+    if median_fake_probability >= 0.70 and fake_frame_ratio >= 0.60:
+        prediction = "FAKE"
+        confidence = median_fake_probability
+        css_class = "fake"
+        icon = "⚠️"
+    elif median_fake_probability <= 0.30 and fake_frame_ratio <= 0.30:
+        prediction = "REAL"
+        confidence = 1.0 - median_fake_probability
+        css_class = "real"
+        icon = "✓"
     else:
-        inject_custom_css()
-        render_navbar()
+        prediction = "UNCERTAIN"
+        confidence = max(
+            median_fake_probability,
+            1.0 - median_fake_probability
+        )
+        css_class = "uncertain"
+        icon = "◐"
 
-        model, cascade, transform, device, model_loaded, model_error = load_deepfake_detector()
-        if model_error:
-            st.error(f"Model unavailable: {model_error}")
+    average_fake_probability = median_fake_probability
+    real_probability = 1.0 - average_fake_probability
 
-        if st.session_state.current_page == "Dashboard":
-            render_dashboard(model_loaded, device)
-        elif st.session_state.current_page == "Image Detection":
-            render_image_detection(model, cascade, transform, device, model_loaded)
-        elif st.session_state.current_page == "Video Detection":
-            render_video_detection(model, cascade, transform, device, model_loaded)
-        elif st.session_state.current_page == "Model Evaluation":
-            render_evaluation_page()
-        elif st.session_state.current_page == "About":
-            render_about_page()
-        elif st.session_state.current_page == "History":
-            render_detection_history()
+    c1, c2, c3 = st.columns([1.0, 1.0, 1.0])
 
 
-if __name__ == "__main__":
-    main()
+
+    with c1:
+
+        result_card(
+
+            prediction,
+
+            confidence,
+
+            css_class,
+
+            icon,
+
+        )
+
+
+
+    with c2:
+
+        st.metric("DURATION", f"{duration:.1f}s")
+
+        st.metric("FRAMES ANALYSED", len(fake_probabilities))
+
+
+
+    with c3:
+
+        st.metric("FACES DETECTED", detected_faces)
+
+        st.metric(
+
+            "FAKE PROBABILITY",
+
+            f"{average_fake_probability * 100:.2f}%",
+
+        )
+
+        st.metric(
+            "FAKE FRAME AGREEMENT",
+            f"{fake_frame_ratio * 100:.0f}%",
+        )
+
+
+
+    a, b = st.columns(2)
+
+
+
+    with a:
+
+        st.caption("Fake probability")
+
+        st.progress(average_fake_probability)
+
+
+
+    with b:
+
+        st.caption("Real probability")
+
+        st.progress(real_probability)
+
+
+
+    st.warning(
+
+        "Video result is an AI screening prediction and should not be treated "
+
+        "as definitive forensic evidence."
+
+    )
+
+
+
+
+
+# ============================================================
+
+# ABOUT
+
+# ============================================================
+
+
+
+def show_about():
+
+    show_navbar()
+
+
+
+    st.html("""
+
+    <div style="animation:pageIn .45s ease;margin-bottom:10px;">
+
+        <div class="eyebrow">ABOUT DEEPGUARD</div>
+
+        <div class="page-title">
+
+            Intelligence for<br>
+
+            <span>digital authenticity.</span>
+
+        </div>
+
+        <div class="page-description">
+
+            An academic deep learning project exploring the detection
+
+            of manipulated facial media.
+
+        </div>
+
+    </div>
+
+    """)
+
+
+
+    c1, c2, c3 = st.columns(3)
+
+
+
+    with c1:
+
+        st.html("""
+
+        <div class="dark-card" style="height:180px;">
+
+            <div class="card-icon">🧠</div>
+
+            <div class="card-title">ResNet18</div>
+
+            <div class="card-description">
+
+                Transfer learning with a ResNet18 convolutional neural network
+
+                for binary real/fake classification.
+
+            </div>
+
+        </div>
+
+        """)
+
+    with c2:
+
+        st.html("""
+
+        <div class="dark-card" style="height:180px;">
+
+            <div class="card-icon">👤</div>
+
+            <div class="card-title">Face Detection</div>
+
+            <div class="card-description">
+
+                Facial regions are identified before deep learning analysis.
+
+            </div>
+
+        </div>
+
+        """)
+
+
+
+    with c3:
+
+        st.html("""
+
+        <div class="dark-card" style="height:180px;">
+
+            <div class="card-icon">🎬</div>
+
+            <div class="card-title">Video Sampling</div>
+
+            <div class="card-description">
+
+                Multiple video frames are analysed and aggregated into
+
+                a video-level prediction.
+
+            </div>
+
+        </div>
+
+        """)
+
+
+
+    st.html("""
+
+    <div class="dark-card" style="margin-top:5px;height:125px;">
+
+        <div class="card-title">Dataset & Method</div>
+
+        <div class="card-description">
+
+            The current system uses FaceForensics++ real videos and
+
+            DeepFake-manipulated videos. The dataset is separated into
+
+            training, validation and test subsets at the video level.
+
+        </div>
+
+    </div>
+
+    """)
+
+
+
+    st.warning(
+
+        "Deepfake detectors may not generalise perfectly to manipulation "
+
+        "techniques or AI generators that were not represented in training."
+
+    )
+
+
+
+
+
+# ============================================================
+
+# MAIN ROUTER
+
+# ============================================================
+
+
+
+if not st.session_state.logged_in:
+
+    show_auth()
+
+else:
+
+    # Compact horizontal navigation.
+
+    n1, n2, n3, n4, n5 = st.columns([1.15, 1.15, 1.15, 1.15, .8])
+
+
+
+    with n1:
+
+        if st.button("HOME", key="nav_home"):
+
+            st.session_state.page = "Dashboard"
+
+            st.rerun()
+
+
+
+    with n2:
+
+        if st.button("IMAGE", key="nav_image"):
+
+            st.session_state.page = "Image Detection"
+
+            st.rerun()
+
+
+
+    with n3:
+
+        if st.button("VIDEO", key="nav_video"):
+
+            st.session_state.page = "Video Detection"
+
+            st.rerun()
+
+
+
+    with n4:
+
+        if st.button("ABOUT", key="nav_about"):
+
+            st.session_state.page = "About"
+
+            st.rerun()
+
+
+
+    with n5:
+
+        if st.button("LOGOUT", key="logout"):
+
+            st.session_state.logged_in = False
+
+            st.session_state.username = ""
+
+            st.session_state.page = "Dashboard"
+
+            st.rerun()
+
+
+
+    if st.session_state.page == "Dashboard":
+
+        show_dashboard()
+
+    elif st.session_state.page == "Image Detection":
+
+        show_image_detection()
+
+    elif st.session_state.page == "Video Detection":
+
+        show_video_detection()
+
+    elif st.session_state.page == "About":
+
+        show_about()
+
+
+
+    st.html("""
+
+    <div style="
+
+        text-align:center;
+
+        color:#4f5160;
+
+        font-size:8px;
+
+        letter-spacing:1px;
+
+        margin-top:4px;
+
+    ">
+
+        🛡️ DEEPGUARD · AI MEDIA SECURITY · RESNET18
+
+    </div>
+
+    """)
